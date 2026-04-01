@@ -85,6 +85,36 @@ IP_RES_LIMIT = 40
 FAST_PROFILE = False
 CKPT_FILE = ".iocs_checkpoint.json"
 
+# ======  OSINT source toggles (global, all ON by default)  ======
+OSINT_IP_SOURCES = {
+    "dshield": True,
+    "blocklistde": True,
+    "asn_drop": True,
+    "feodo": True,
+    "cinsscore": True,
+    "et_compromised": True,
+    "abuseipdb": True,
+    "threatfox": True,
+    "urlhaus": True,
+    "otx": True,
+}
+
+OSINT_DOMAIN_SOURCES = {
+    "openphish": True,
+    "phishtank": True,
+    "urlhaus": True,
+    "threatfox": True,
+    "otx": True,
+    "rdap": True,
+}
+
+OSINT_HASH_SOURCES = {
+    "malwarebazaar": True,
+    "threatfox": True,
+    "urlhaus": True,
+    "otx": True,
+}
+
 # ====== TOR / Onionoo ======
 ONIONOO_BASE = "https://onionoo.torproject.org"
 TOR_TIMEOUT = 18
@@ -603,12 +633,18 @@ DEFAULT_TTL_ASNDROP = 24 * 3600
 DEFAULT_TTL_DSHIELD = 60 * 60
 DEFAULT_TTL_BLOCKLIST = 60 * 60
 DEFAULT_TTL_OPENPHISH = 12 * 3600
+DEFAULT_TTL_FEODO = 24 * 3600
+DEFAULT_TTL_CINSSCORE = 24 * 3600
+DEFAULT_TTL_ET_COMPROMISED = 24 * 3600
 
 # TTL efectivos (con override por variables de entorno)
 TTL_ASNDROP = _get_int_env("TTL_ASNDROP_S", DEFAULT_TTL_ASNDROP)
 TTL_DSHIELD = _get_int_env("TTL_DSHIELD_S", DEFAULT_TTL_DSHIELD)
 TTL_BLOCKLIST = _get_int_env("TTL_BLOCKLISTDE_S", DEFAULT_TTL_BLOCKLIST)
 TTL_OPENPHISH = _get_int_env("TTL_OPENPHISH_S", DEFAULT_TTL_OPENPHISH)
+TTL_FEODO = _get_int_env("TTL_FEODO_S", DEFAULT_TTL_FEODO)
+TTL_CINSSCORE = _get_int_env("TTL_CINSSCORE_S", DEFAULT_TTL_CINSSCORE)
+TTL_ET_COMPROMISED = _get_int_env("TTL_ET_COMPROMISED_S", DEFAULT_TTL_ET_COMPROMISED)
 
 # === IPtoASN (dataset TSV GZIP) ===============================================
 IP2ASN_V4_URL = "https://iptoasn.com/data/ip2asn-v4.tsv.gz"  # IPv4 → ASN (TSV .gz)  [1](https://iptoasn.com/)
@@ -1022,6 +1058,11 @@ SPAMHAUS_ASNDROP_URL = "https://www.spamhaus.org/drop/asndrop.json"
 # (NUEVO) OpenPhish community feed (no comercial)
 OPENPHISH_FEED_URL = "https://openphish.com/feed.txt"
 
+# === Feeds IP (listas planas, sin API) ========================================
+FEODO_TRACKER_URL = "https://feodotracker.abuse.ch/downloads/ipblocklist.txt"
+CINSSCORE_URL = "https://cinsscore.com/list/ci-badguys.txt"
+ET_COMPROMISED_URL = "https://rules.emergingthreats.net/blockrules/compromised-ips.txt"
+
 # === AbuseIPDB API (IPs) =====================================================
 ABUSEIPDB_API_URL = "https://api.abuseipdb.com/api/v2/check"
 
@@ -1211,6 +1252,63 @@ def load_blocklistde_set():
     return s
 
 
+def _load_ip_set_feed(url, cache_key, ttl_s, label):
+    """Carga genérica de feed de IPs (una por línea) → set."""
+    status, text = fetch_feed_cached_text(url, cache_key, ttl_s=ttl_s)
+    if status in ("miss",) or not text:
+        print(
+            f"[OSINT] {label}: no data (miss)."
+            if LANG == "en"
+            else f"[OSINT] {label}: sin datos (miss)."
+        )
+        return set()
+    if status in ("fresh", "not-modified"):
+        print(f"[OSINT] {label}: {status}.")
+    elif status == "cached":
+        print(
+            f"[OSINT] {label}: using current cache."
+            if LANG == "en"
+            else f"[OSINT] {label}: usando caché vigente."
+        )
+    else:
+        print(
+            f"[OSINT] {label}: offline (stale cache)."
+            if LANG == "en"
+            else f"[OSINT] {label}: sin red (caché antigua)."
+        )
+    s = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _IP4_REGEX.search(line)
+        if not m:
+            continue
+        try:
+            s.add(str(ipaddress.ip_address(m.group(0))))
+        except Exception:
+            continue
+    return s
+
+
+def load_feodo_set():
+    return _load_ip_set_feed(
+        FEODO_TRACKER_URL, "feodo_ipblocklist.txt", TTL_FEODO, "Feodo Tracker"
+    )
+
+
+def load_cinsscore_set():
+    return _load_ip_set_feed(
+        CINSSCORE_URL, "cinsscore_badguys.txt", TTL_CINSSCORE, "CINSscore"
+    )
+
+
+def load_et_compromised_set():
+    return _load_ip_set_feed(
+        ET_COMPROMISED_URL, "et_compromised.txt", TTL_ET_COMPROMISED, "ET Compromised"
+    )
+
+
 def ip_in_range(ip_str, start, end):
     try:
         ip = ipaddress.ip_address(ip_str)
@@ -1310,19 +1408,8 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
         )
         return
 
-    # 2) Toggles por fuente (si no hay global, ON por defecto)
-    osint_toggles = globals().get(
-        "OSINT_IP_SOURCES",
-        {
-            "dshield": True,
-            "blocklistde": True,
-            "asn_drop": True,
-            "abuseipdb": True,
-            "threatfox": True,
-            "urlhaus": True,
-            "otx": True,
-        },
-    )
+    # 2) Toggles por fuente
+    osint_toggles = OSINT_IP_SOURCES
 
     # 2.5) API keys para fuentes nuevas
     ABUSEIPDB_KEY = os.getenv("ABUSEIPDB_API_KEY") or ""
@@ -1356,11 +1443,14 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
     asn_drop = load_asn_drop_set() if osint_toggles.get("asn_drop", True) else set()
     dshield = load_dshield_ranges() if osint_toggles.get("dshield", True) else []
     blkde = load_blocklistde_set() if osint_toggles.get("blocklistde", True) else set()
+    feodo = load_feodo_set() if osint_toggles.get("feodo", True) else set()
+    cinsscore = load_cinsscore_set() if osint_toggles.get("cinsscore", True) else set()
+    et_comp = load_et_compromised_set() if osint_toggles.get("et_compromised", True) else set()
 
     print(
-        f"[OSINT] Feeds loaded → DShield:/24={len(dshield)}  blocklist.de={len(blkde)}  ASN-DROP={len(asn_drop)}"
+        f"[OSINT] Feeds loaded → DShield:/24={len(dshield)}  blocklist.de={len(blkde)}  ASN-DROP={len(asn_drop)}  Feodo={len(feodo)}  CINSscore={len(cinsscore)}  ET={len(et_comp)}"
         if LANG == "en"
-        else f"[OSINT] Feeds cargados → DShield:/24={len(dshield)}  blocklist.de={len(blkde)}  ASN-DROP={len(asn_drop)}"
+        else f"[OSINT] Feeds cargados → DShield:/24={len(dshield)}  blocklist.de={len(blkde)}  ASN-DROP={len(asn_drop)}  Feodo={len(feodo)}  CINSscore={len(cinsscore)}  ET={len(et_comp)}"
     )
     api_sources = []
     if use_abuseipdb:
@@ -1428,6 +1518,9 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
         "bl_dshield_24",
         "bl_dshield_targets",
         "bl_blocklistde_48h",
+        "bl_feodo",
+        "bl_cinsscore",
+        "bl_et_compromised",
     ]
     if use_abuseipdb:
         fields += [
@@ -1481,6 +1574,9 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
     hits_threatfox = 0
     hits_urlhaus = 0
     hits_otx = 0
+    hits_feodo = 0
+    hits_cinsscore = 0
+    hits_et = 0
     abuseipdb_rate_limited = False
 
     # 6) Procesado
@@ -1500,6 +1596,9 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                     "bl_dshield_24": "no",
                     "bl_dshield_targets": "0",
                     "bl_blocklistde_48h": "no",
+                    "bl_feodo": "no",
+                    "bl_cinsscore": "no",
+                    "bl_et_compromised": "no",
                 }
 
                 # DShield: si la IP cae en uno de los rangos /24 top de 3 días
@@ -1515,6 +1614,21 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                 if blkde and ip in blkde:
                     row["bl_blocklistde_48h"] = "yes"
                     hits_blkde += 1
+
+                # Feodo Tracker (botnet C2)
+                if feodo and ip in feodo:
+                    row["bl_feodo"] = "yes"
+                    hits_feodo += 1
+
+                # CINSscore (bad actors)
+                if cinsscore and ip in cinsscore:
+                    row["bl_cinsscore"] = "yes"
+                    hits_cinsscore += 1
+
+                # ET Compromised
+                if et_comp and ip in et_comp:
+                    row["bl_et_compromised"] = "yes"
+                    hits_et += 1
 
                 # ASN-DROP (orden de resolución: VT → IPtoASN)
                 asn_num = None
@@ -1593,6 +1707,9 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                 if (
                     row["bl_dshield_24"] == "yes"
                     or row["bl_blocklistde_48h"] == "yes"
+                    or row["bl_feodo"] == "yes"
+                    or row["bl_cinsscore"] == "yes"
+                    or row["bl_et_compromised"] == "yes"
                     or row["asn_drop"] == "yes"
                     or (
                         row.get("abuseipdb_score")
@@ -1614,6 +1731,9 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                 _mal = (
                     row["asn_drop"] == "yes"
                     or row["bl_blocklistde_48h"] == "yes"
+                    or row["bl_feodo"] == "yes"
+                    or row["bl_cinsscore"] == "yes"
+                    or row["bl_et_compromised"] == "yes"
                     or row.get("threatfox_status") == "ok"
                     or (
                         row.get("urlhaus_status") == "ok"
@@ -1660,6 +1780,9 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
         print(f"[i]  - DShield (/24): {hits_dshield}")
         print(f"[i]  - blocklist.de : {hits_blkde}")
         print(f"[i]  - ASN-DROP     : {hits_asn}")
+        print(f"[i]  - Feodo Tracker: {hits_feodo}")
+        print(f"[i]  - CINSscore    : {hits_cinsscore}")
+        print(f"[i]  - ET Compromis.: {hits_et}")
         if use_abuseipdb:
             print(f"[i]  - AbuseIPDB    : {hits_abuseipdb}")
         if use_threatfox:
@@ -1677,6 +1800,9 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
         print(f"[i]  - DShield (/24): {hits_dshield}")
         print(f"[i]  - blocklist.de : {hits_blkde}")
         print(f"[i]  - ASN-DROP     : {hits_asn}")
+        print(f"[i]  - Feodo Tracker: {hits_feodo}")
+        print(f"[i]  - CINSscore    : {hits_cinsscore}")
+        print(f"[i]  - ET Compromis.: {hits_et}")
         if use_abuseipdb:
             print(f"[i]  - AbuseIPDB    : {hits_abuseipdb}")
         if use_threatfox:
@@ -1834,14 +1960,18 @@ def run_domain_osint_lookup(list_file: str = DOMAIN_LIST_FILE, resume=None):
         return
 
     # Carga feeds/contexto
-    openphish_hosts = load_openphish_hosts()
+    dom_toggles = OSINT_DOMAIN_SOURCES
+    openphish_hosts = load_openphish_hosts() if dom_toggles.get("openphish", True) else set()
     # opcionales por clave:
     PHISHTANK_APP_KEY = os.getenv("PHISHTANK_APP_KEY") or ""
     ABUSECH_KEY = os.getenv("ABUSECH_AUTH_KEY") or os.getenv("MBZ_AUTH_KEY") or ""
     OTX_KEY = os.getenv("OTX_API_KEY") or ""
-    use_threatfox = bool(ABUSECH_KEY)
-    use_urlhaus = True  # URLhaus funciona sin auth key también
-    use_otx = bool(OTX_KEY)
+    use_openphish = dom_toggles.get("openphish", True)
+    use_phishtank = dom_toggles.get("phishtank", True)
+    use_threatfox = dom_toggles.get("threatfox", True) and bool(ABUSECH_KEY)
+    use_urlhaus = dom_toggles.get("urlhaus", True)
+    use_otx = dom_toggles.get("otx", True) and bool(OTX_KEY)
+    use_rdap = dom_toggles.get("rdap", True)
 
     if not ABUSECH_KEY:
         print(
@@ -2360,12 +2490,14 @@ def run_hash_osint_lookup(list_file=None, resume=None):
         print("⚠ No hashes to process." if LANG == "en" else "⚠ Sin hashes a procesar.")
         return
 
+    hash_toggles = OSINT_HASH_SOURCES
     MBZ_AUTH_KEY = os.getenv("MBZ_AUTH_KEY") or ""
     ABUSECH_KEY = os.getenv("ABUSECH_AUTH_KEY") or MBZ_AUTH_KEY
     OTX_KEY = os.getenv("OTX_API_KEY") or ""
-    use_threatfox = bool(ABUSECH_KEY)
-    use_urlhaus = True
-    use_otx = bool(OTX_KEY)
+    use_malwarebazaar = hash_toggles.get("malwarebazaar", True) and bool(MBZ_AUTH_KEY)
+    use_threatfox = hash_toggles.get("threatfox", True) and bool(ABUSECH_KEY)
+    use_urlhaus = hash_toggles.get("urlhaus", True)
+    use_otx = hash_toggles.get("otx", True) and bool(OTX_KEY)
 
     if not ABUSECH_KEY:
         print(
@@ -2434,7 +2566,7 @@ def run_hash_osint_lookup(list_file=None, resume=None):
                     "mbz_signature": "",
                     "mbz_status": "",
                 }
-                if MBZ_AUTH_KEY:
+                if use_malwarebazaar and MBZ_AUTH_KEY:
                     res = malwarebazaar_lookup(h, MBZ_AUTH_KEY)
                 row = {"hash": h, **res}
 
@@ -3890,6 +4022,135 @@ def run_domain_list_lookup(api_keys, list_file: str = DOMAIN_LIST_FILE, resume=N
         print(f"\nHecho. Salida: {out_csv}\n{frase_epica_random()}\n")
 
 
+# === Menú de configuración de fuentes OSINT ===
+
+
+def osint_config_menu():
+    """Bilingual submenu to toggle OSINT sources on/off."""
+
+    _LABELS = {
+        # IP sources
+        "dshield":        "DShield       (IP)",
+        "blocklistde":    "blocklist.de  (IP)",
+        "asn_drop":       "ASN-DROP      (IP)",
+        "feodo":          "Feodo Tracker (IP)",
+        "cinsscore":      "CINSscore     (IP)",
+        "et_compromised": "ET Compromised(IP)",
+        "abuseipdb":      "AbuseIPDB     (IP)  [API key]",
+        # IP+Domain+Hash shared
+        "threatfox_ip":   "ThreatFox     (IP)  [API key]",
+        "urlhaus_ip":     "URLhaus       (IP)",
+        "otx_ip":         "OTX AlienVault(IP)  [API key]",
+        # Domain sources
+        "openphish":      "OpenPhish     (Dom)",
+        "phishtank":      "PhishTank     (Dom)",
+        "urlhaus_dom":    "URLhaus       (Dom)",
+        "threatfox_dom":  "ThreatFox     (Dom) [API key]",
+        "otx_dom":        "OTX AlienVault(Dom) [API key]",
+        "rdap":           "RDAP/Whois    (Dom)",
+        # Hash sources
+        "malwarebazaar":  "MalwareBazaar (Hash)[API key]",
+        "threatfox_hash": "ThreatFox     (Hash)[API key]",
+        "urlhaus_hash":   "URLhaus       (Hash)",
+        "otx_hash":       "OTX AlienVault(Hash)[API key]",
+    }
+
+    # Flat ordered list: (display_label, dict_ref, key_in_dict)
+    _ENTRIES = [
+        # --- IP ---
+        ("dshield",        OSINT_IP_SOURCES,     "dshield"),
+        ("blocklistde",    OSINT_IP_SOURCES,     "blocklistde"),
+        ("asn_drop",       OSINT_IP_SOURCES,     "asn_drop"),
+        ("feodo",          OSINT_IP_SOURCES,     "feodo"),
+        ("cinsscore",      OSINT_IP_SOURCES,     "cinsscore"),
+        ("et_compromised", OSINT_IP_SOURCES,     "et_compromised"),
+        ("abuseipdb",      OSINT_IP_SOURCES,     "abuseipdb"),
+        ("threatfox_ip",   OSINT_IP_SOURCES,     "threatfox"),
+        ("urlhaus_ip",     OSINT_IP_SOURCES,     "urlhaus"),
+        ("otx_ip",         OSINT_IP_SOURCES,     "otx"),
+        # --- Domain ---
+        ("openphish",      OSINT_DOMAIN_SOURCES, "openphish"),
+        ("phishtank",      OSINT_DOMAIN_SOURCES, "phishtank"),
+        ("urlhaus_dom",    OSINT_DOMAIN_SOURCES, "urlhaus"),
+        ("threatfox_dom",  OSINT_DOMAIN_SOURCES, "threatfox"),
+        ("otx_dom",        OSINT_DOMAIN_SOURCES, "otx"),
+        ("rdap",           OSINT_DOMAIN_SOURCES, "rdap"),
+        # --- Hash ---
+        ("malwarebazaar",  OSINT_HASH_SOURCES,   "malwarebazaar"),
+        ("threatfox_hash", OSINT_HASH_SOURCES,   "threatfox"),
+        ("urlhaus_hash",   OSINT_HASH_SOURCES,   "urlhaus"),
+        ("otx_hash",       OSINT_HASH_SOURCES,   "otx"),
+    ]
+
+    while True:
+        if LANG == "en":
+            print("\n========================================")
+            print("  OSINT SOURCES — Configuration")
+            print("========================================")
+        else:
+            print("\n========================================")
+            print("  FUENTES OSINT — Configuración")
+            print("========================================")
+
+        # --- IP header ---
+        print("\n  --- IP ---")
+        for idx, (lbl_key, dref, dkey) in enumerate(_ENTRIES, 1):
+            if idx == 11:
+                header = "Domain" if LANG == "en" else "Dominio"
+                print(f"\n  --- {header} ---")
+            if idx == 17:
+                print("\n  --- Hash ---")
+            state = dref.get(dkey, True)
+            tag = "[ON] " if state else "[OFF]"
+            print(f"  {idx:>2}) {tag} {_LABELS[lbl_key]}")
+
+        if LANG == "en":
+            print(f"\n  a) Enable ALL    n) Disable ALL    0) Back")
+            sel = input("\nToggle source # (or a/n/0): ").strip().lower()
+        else:
+            print(f"\n  a) Activar TODAS  n) Desactivar TODAS  0) Volver")
+            sel = input("\nCambiar fuente # (o a/n/0): ").strip().lower()
+
+        if sel == "0":
+            break
+        elif sel == "a":
+            for _, dref, dkey in _ENTRIES:
+                dref[dkey] = True
+            print(
+                "\n✅ All sources enabled."
+                if LANG == "en"
+                else "\n✅ Todas las fuentes activadas."
+            )
+        elif sel == "n":
+            for _, dref, dkey in _ENTRIES:
+                dref[dkey] = False
+            print(
+                "\n⛔ All sources disabled."
+                if LANG == "en"
+                else "\n⛔ Todas las fuentes desactivadas."
+            )
+        else:
+            try:
+                num = int(sel)
+                if 1 <= num <= len(_ENTRIES):
+                    lbl_key, dref, dkey = _ENTRIES[num - 1]
+                    dref[dkey] = not dref.get(dkey, True)
+                    new_state = "ON" if dref[dkey] else "OFF"
+                    print(f"\n  {_LABELS[lbl_key]}  →  [{new_state}]")
+                else:
+                    print(
+                        "Invalid number."
+                        if LANG == "en"
+                        else "Número no válido."
+                    )
+            except ValueError:
+                print(
+                    "Invalid option."
+                    if LANG == "en"
+                    else "Opción no válida."
+                )
+
+
 # === Menús (con estado SSL visible)
 
 
@@ -3907,6 +4168,7 @@ def main_menu(ssl_status: str):
         )
         print("5) Refresh OSINT feeds now — Fuel the machine")
         print("6) DEBUG / OSINT BACKSTAGE — Behind the Noise ")
+        print("7) Configure OSINT sources — Choose your arsenal")
         print("x) Clear checkpoint — Reset the stage")
         print("0) Exit — Leave the battlefield")
         return input("\nChoose your weapon: ").strip()
@@ -3918,6 +4180,7 @@ def main_menu(ssl_status: str):
         print(f"4) Chequear SSL / VPN / Proxy  [estado: {ssl_status.upper()}]")
         print("5) Refrescar feeds OSINT ahora")
         print("6) DEBUG / HERRAMIENTAS OSINT")
+        print("7) Configurar fuentes OSINT — Elige tu arsenal")
         print("x) Borrar checkpoint")
         print("0) Salir")
         return input("\nSelecciona una opción: ").strip()
@@ -4374,7 +4637,9 @@ def main():
             while True:
                 sub = ip_menu(FAST_PROFILE, ssl_status)
 
-                if ssl_status == "mitm" and sub in ("1", "2", "3", "6", "7", "8", "9"):
+                # En MITM bloqueamos solo rutas dependientes de VT.
+                # La opción 2 (OSINT IP) debe seguir funcionando.
+                if ssl_status == "mitm" and sub in ("1", "3", "6", "7", "8", "9"):
                     if LANG == "en":
                         print("\n❌ BLOCKED by SSL intercept.\n")
                     else:
@@ -4447,6 +4712,9 @@ def main():
             ssl_status = auto_check_ssl()
 
         elif choice == "7":
+            osint_config_menu()
+
+        elif choice == "9":
             suggest_test_ips_from_cache()
 
         elif choice == "8":
@@ -4473,12 +4741,23 @@ def main():
             while True:
                 sub = domain_menu(ssl_status)
 
-                if ssl_status == "mitm" and sub in ("1", "2", "3"):
+                # En MITM bloqueamos solo VT en dominios.
+                # 1 = VT lista (bloqueado), 2 = OSINT (permitido).
+                # 3 = Reanudar: bloqueado solo si el checkpoint es de VT.
+                if ssl_status == "mitm" and sub == "1":
                     if LANG == "en":
                         print("\n❌ BLOCKED by SSL intercept.\n")
                     else:
                         print("\n❌ BLOQUEADO por SSL intercept.\n")
                     continue
+                if ssl_status == "mitm" and sub == "3":
+                    ck = load_ckpt()
+                    if ck and ck.get("mode") == "domains_list":
+                        if LANG == "en":
+                            print("\n❌ BLOCKED by SSL intercept.\n")
+                        else:
+                            print("\n❌ BLOQUEADO por SSL intercept.\n")
+                        continue
 
                 if sub == "1":
                     path = safe_input(
@@ -4567,7 +4846,17 @@ def main():
             while True:
                 sub = hash_menu(ssl_status)
 
-                if ssl_status == "mitm" and sub in ("1", "2", "3", "4"):
+                # En MITM bloqueamos solo VT en hashes.
+                # 3 = OSINT (permitido), 4 = Reanudar: solo bloqueado si ck es VT.
+                blocked_hash = False
+                if ssl_status == "mitm" and sub in ("1", "2"):
+                    blocked_hash = True
+                elif ssl_status == "mitm" and sub == "4":
+                    ck = load_ckpt()
+                    if ck and ck.get("mode") == "hash_list":
+                        blocked_hash = True
+
+                if blocked_hash:
                     if LANG == "en":
                         print("\n❌ BLOCKED by SSL intercept.")
                         ans = safe_input(
