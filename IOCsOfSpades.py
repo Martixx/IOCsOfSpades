@@ -44,7 +44,7 @@ import shutil
 
 # === IOCs of Spades — MOTÖRHEAD EDITION ======================================
 APP_NAME = "IOCs of Spades"
-APP_VERSION = '2.0 "Lemmy"'
+APP_VERSION = '2.1 "Lemmy"'
 APP_SHORT = "IOS"
 APP_COPY = " BORN TO SCAN // LIVE TO WIN"
 
@@ -739,6 +739,35 @@ def read_lines(path):
         return [x.strip() for x in f if x.strip()]
 
 
+def load_api_keys(path=API_KEYS_FILE):
+    """
+    Lee IOCS-apikeys.txt con formato CLAVE=valor (una por línea).
+    Claves reconocidas: VT, ABUSEIPDB, ABUSECH.
+    Retrocompatible: línea sin '=' se trata como VT key.
+    """
+    keys = {"VT": [], "ABUSEIPDB": "", "ABUSECH": ""}
+    if not os.path.exists(path):
+        return keys
+    for line in read_lines(path):
+        if line.startswith("#"):
+            continue
+        if "=" in line:
+            prefix, _, value = line.partition("=")
+            prefix = prefix.strip().upper()
+            value = value.strip()
+            if prefix == "VT" and value:
+                keys["VT"].append(value)
+            elif prefix == "ABUSEIPDB" and value:
+                keys["ABUSEIPDB"] = value
+            elif prefix == "ABUSECH" and value:
+                keys["ABUSECH"] = value
+        else:
+            # Retrocompatible: línea sin prefijo = VT API key
+            if line:
+                keys["VT"].append(line)
+    return keys
+
+
 def save_ckpt(data: dict):
     try:
         with open(CKPT_FILE, "w", encoding="utf-8") as fh:
@@ -990,6 +1019,15 @@ SPAMHAUS_ASNDROP_URL = "https://www.spamhaus.org/drop/asndrop.json"
 
 # (NUEVO) OpenPhish community feed (no comercial)
 OPENPHISH_FEED_URL = "https://openphish.com/feed.txt"
+
+# === AbuseIPDB API (IPs) =====================================================
+ABUSEIPDB_API_URL = "https://api.abuseipdb.com/api/v2/check"
+
+# === ThreatFox API (IPs, domains, hashes) — abuse.ch ==========================
+THREATFOX_API_URL = "https://threatfox-api.abuse.ch/api/v1/"
+
+# === URLhaus API (hosts, payloads) — abuse.ch =================================
+URLHAUS_API_URL = "https://urlhaus-api.abuse.ch/v1/"
 
 
 def load_asn_drop_set():
@@ -1274,8 +1312,31 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
             "dshield": True,
             "blocklistde": True,
             "asn_drop": True,
+            "abuseipdb": True,
+            "threatfox": True,
+            "urlhaus": True,
         },
     )
+
+    # 2.5) API keys para fuentes nuevas
+    ABUSEIPDB_KEY = os.getenv("ABUSEIPDB_API_KEY") or ""
+    ABUSECH_KEY = os.getenv("ABUSECH_AUTH_KEY") or os.getenv("MBZ_AUTH_KEY") or ""
+    use_abuseipdb = osint_toggles.get("abuseipdb", True) and bool(ABUSEIPDB_KEY)
+    use_threatfox = osint_toggles.get("threatfox", True) and bool(ABUSECH_KEY)
+    use_urlhaus = osint_toggles.get("urlhaus", True)
+
+    if osint_toggles.get("abuseipdb", True) and not ABUSEIPDB_KEY:
+        print(
+            "[OSINT] AbuseIPDB: skipped (set ABUSEIPDB_API_KEY env var to enable)"
+            if LANG == "en"
+            else "[OSINT] AbuseIPDB: omitido (configura ABUSEIPDB_API_KEY para activar)"
+        )
+    if osint_toggles.get("threatfox", True) and not ABUSECH_KEY:
+        print(
+            "[OSINT] ThreatFox: skipped (set ABUSECH_AUTH_KEY env var to enable)"
+            if LANG == "en"
+            else "[OSINT] ThreatFox: omitido (configura ABUSECH_AUTH_KEY para activar)"
+        )
 
     # 3) Carga de feeds (respetando toggles)
     asn_drop = load_asn_drop_set() if osint_toggles.get("asn_drop", True) else set()
@@ -1287,6 +1348,19 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
         if LANG == "en"
         else f"[OSINT] Feeds cargados → DShield:/24={len(dshield)}  blocklist.de={len(blkde)}  ASN-DROP={len(asn_drop)}"
     )
+    api_sources = []
+    if use_abuseipdb:
+        api_sources.append("AbuseIPDB")
+    if use_threatfox:
+        api_sources.append("ThreatFox")
+    if use_urlhaus:
+        api_sources.append("URLhaus")
+    if api_sources:
+        print(
+            f"[OSINT] API sources enabled: {', '.join(api_sources)}"
+            if LANG == "en"
+            else f"[OSINT] Fuentes API activas: {', '.join(api_sources)}"
+        )
 
     # 3.5) Índice IPtoASN (para resolver ASN sin VT)
     ip2asn_ready = load_ip2asn_index()
@@ -1338,6 +1412,34 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
         "bl_dshield_targets",
         "bl_blocklistde_48h",
     ]
+    if use_abuseipdb:
+        fields += [
+            "abuseipdb_score",
+            "abuseipdb_reports",
+            "abuseipdb_usage",
+            "abuseipdb_isp",
+            "abuseipdb_country",
+            "abuseipdb_is_tor",
+            "abuseipdb_last_report",
+            "abuseipdb_status",
+        ]
+    if use_threatfox:
+        fields += [
+            "threatfox_malware",
+            "threatfox_threat_type",
+            "threatfox_confidence",
+            "threatfox_tags",
+            "threatfox_first_seen",
+            "threatfox_status",
+        ]
+    if use_urlhaus:
+        fields += [
+            "urlhaus_url_count",
+            "urlhaus_spamhaus_dbl",
+            "urlhaus_surbl",
+            "urlhaus_firstseen",
+            "urlhaus_status",
+        ]
     start_i = (
         int(resume.get("idx", 0))
         if (resume and resume.get("mode") == "ip_osint")
@@ -1350,6 +1452,10 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
     hits_dshield = 0
     hits_blkde = 0
     hits_asn = 0
+    hits_abuseipdb = 0
+    hits_threatfox = 0
+    hits_urlhaus = 0
+    abuseipdb_rate_limited = False
 
     # 6) Procesado
     with open(out_csv, mode, newline="", encoding="utf-8") as fh:
@@ -1412,11 +1518,45 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                     row["asn_drop"] = ""
                     row["asn_drop_source"] = ""
 
+                # AbuseIPDB (API per-IP)
+                if use_abuseipdb and not abuseipdb_rate_limited:
+                    ab = abuseipdb_check(ip, ABUSEIPDB_KEY)
+                    row.update(ab)
+                    if ab.get("abuseipdb_status") == "rate_limited":
+                        abuseipdb_rate_limited = True
+                        print(
+                            "\n[OSINT] ⚠ AbuseIPDB rate limit reached — disabling for remaining IPs."
+                            if LANG == "en"
+                            else "\n[OSINT] ⚠ AbuseIPDB límite alcanzado — desactivando para las IPs restantes."
+                        )
+                    elif ab.get("abuseipdb_score") and int(ab["abuseipdb_score"]) > 0:
+                        hits_abuseipdb += 1
+                    time.sleep(0.3)
+
+                # ThreatFox (API per-IP)
+                if use_threatfox:
+                    tf = threatfox_search_ioc(ip, ABUSECH_KEY)
+                    row.update(tf)
+                    if tf.get("threatfox_status") == "ok":
+                        hits_threatfox += 1
+                    time.sleep(0.2)
+
+                # URLhaus (API per-IP)
+                if use_urlhaus:
+                    uh = urlhaus_host_lookup(ip, ABUSECH_KEY)
+                    row.update(uh)
+                    if uh.get("urlhaus_status") == "ok" and uh.get("urlhaus_url_count", "0") != "0":
+                        hits_urlhaus += 1
+                    time.sleep(0.2)
+
                 # ¿Alguna señal?
                 if (
                     row["bl_dshield_24"] == "yes"
                     or row["bl_blocklistde_48h"] == "yes"
                     or row["asn_drop"] == "yes"
+                    or (row.get("abuseipdb_score") and row["abuseipdb_score"] not in ("", "0"))
+                    or row.get("threatfox_status") == "ok"
+                    or (row.get("urlhaus_status") == "ok" and row.get("urlhaus_url_count", "0") != "0")
                 ):
                     hits_any += 1
 
@@ -1436,7 +1576,14 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
         print(f"[i] Processed IPs: {len(ip_list)} | Matches (any signal): {hits_any}")
         print(f"[i]  - DShield (/24): {hits_dshield}")
         print(f"[i]  - blocklist.de : {hits_blkde}")
-        print(f"[i]  - ASN-DROP     : {hits_asn}\n")
+        print(f"[i]  - ASN-DROP     : {hits_asn}")
+        if use_abuseipdb:
+            print(f"[i]  - AbuseIPDB    : {hits_abuseipdb}")
+        if use_threatfox:
+            print(f"[i]  - ThreatFox    : {hits_threatfox}")
+        if use_urlhaus:
+            print(f"[i]  - URLhaus      : {hits_urlhaus}")
+        print()
     else:
         print(f"\nHecho. Salida: {out_csv}")
         print(
@@ -1444,7 +1591,14 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
         )
         print(f"[i]  - DShield (/24): {hits_dshield}")
         print(f"[i]  - blocklist.de : {hits_blkde}")
-        print(f"[i]  - ASN-DROP     : {hits_asn}\n")
+        print(f"[i]  - ASN-DROP     : {hits_asn}")
+        if use_abuseipdb:
+            print(f"[i]  - AbuseIPDB    : {hits_abuseipdb}")
+        if use_threatfox:
+            print(f"[i]  - ThreatFox    : {hits_threatfox}")
+        if use_urlhaus:
+            print(f"[i]  - URLhaus      : {hits_urlhaus}")
+        print()
     print("\n" + frase_epica_random() + "\n")
 
 
@@ -1559,10 +1713,12 @@ def rdap_lookup(domain: str):
         return {"registrar": "", "created": "", "status": f"ERROR:{e}"}
 
 
-# URLhaus (opcional: requiere Auth-Key para bulk fiable) [5](https://virustotal.readme.io/)
+# URLhaus (opcional: requiere Auth-Key para bulk fiable)
 def urlhaus_present_for_domain(domain: str, auth_key: str = None):
-    # Placeholder: sin Auth-Key, mejor no martillear; si tienes Auth-Key, en la siguiente iteración te enganchamos el RPZ host dump o endpoint adecuado.
-    return ""
+    result = urlhaus_host_lookup(domain, auth_key or "")
+    if result.get("urlhaus_status") == "ok" and result.get("urlhaus_url_count", "0") != "0":
+        return "yes"
+    return "no" if result.get("urlhaus_status") in ("ok", "not_found") else ""
 
 
 def run_domain_osint_lookup(list_file: str = DOMAIN_LIST_FILE, resume=None):
@@ -1590,8 +1746,17 @@ def run_domain_osint_lookup(list_file: str = DOMAIN_LIST_FILE, resume=None):
     # Carga feeds/contexto
     openphish_hosts = load_openphish_hosts()
     # opcionales por clave:
-    PHISHTANK_APP_KEY = os.getenv("PHISHTANK_APP_KEY") or ""  # si la pones en entorno
-    URLHAUS_AUTH_KEY = os.getenv("URLHAUS_AUTH_KEY") or ""  # si dispones de Auth-Key
+    PHISHTANK_APP_KEY = os.getenv("PHISHTANK_APP_KEY") or ""
+    ABUSECH_KEY = os.getenv("ABUSECH_AUTH_KEY") or os.getenv("MBZ_AUTH_KEY") or ""
+    use_threatfox = bool(ABUSECH_KEY)
+    use_urlhaus = True  # URLhaus funciona sin auth key también
+
+    if not ABUSECH_KEY:
+        print(
+            "[OSINT] ThreatFox: skipped (set ABUSECH_AUTH_KEY env var to enable)"
+            if LANG == "en"
+            else "[OSINT] ThreatFox: omitido (configura ABUSECH_AUTH_KEY para activar)"
+        )
 
     out_csv = f"{formatted_time}_DOMAINS_OSINT.csv"
     fields = [
@@ -1599,6 +1764,24 @@ def run_domain_osint_lookup(list_file: str = DOMAIN_LIST_FILE, resume=None):
         "ctx_openphish_present",
         "ctx_phishtank_status",
         "ctx_urlhaus_present",
+    ]
+    if use_urlhaus:
+        fields += [
+            "urlhaus_url_count",
+            "urlhaus_spamhaus_dbl",
+            "urlhaus_surbl",
+            "urlhaus_firstseen",
+        ]
+    if use_threatfox:
+        fields += [
+            "threatfox_malware",
+            "threatfox_threat_type",
+            "threatfox_confidence",
+            "threatfox_tags",
+            "threatfox_first_seen",
+            "threatfox_status",
+        ]
+    fields += [
         "rdap_registrar",
         "rdap_created",
         "rdap_status",
@@ -1627,32 +1810,48 @@ def run_domain_osint_lookup(list_file: str = DOMAIN_LIST_FILE, resume=None):
 
                 op_present = (
                     "yes" if d in openphish_hosts else "no"
-                )  # OpenPhish feed (no‑comercial) [9](blob:https://www.microsoft365.com/8b872bb7-586a-415e-9e27-2520f489775a)
+                )
                 pt_status = (
                     phishtank_status(d, PHISHTANK_APP_KEY) if PHISHTANK_APP_KEY else ""
-                )  # PhishTank API (si hay app_key)
-                uh_present = urlhaus_present_for_domain(
-                    d, URLHAUS_AUTH_KEY
-                )  # pendiente de enganchar RPZ/API con Auth-Key [5](https://virustotal.readme.io/)
-
-                rdap = rdap_lookup(d)  # registrar/created/status
-
-                w.writerow(
-                    {
-                        "domain": d,
-                        "ctx_openphish_present": op_present,
-                        "ctx_phishtank_status": pt_status,
-                        "ctx_urlhaus_present": uh_present,
-                        "rdap_registrar": rdap.get("registrar", ""),
-                        "rdap_created": rdap.get("created", ""),
-                        "rdap_status": rdap.get("status", ""),
-                    }
                 )
+                uh_present = urlhaus_present_for_domain(
+                    d, ABUSECH_KEY
+                )
+
+                row = {
+                    "domain": d,
+                    "ctx_openphish_present": op_present,
+                    "ctx_phishtank_status": pt_status,
+                    "ctx_urlhaus_present": uh_present,
+                }
+
+                # URLhaus enrichment (host details)
+                if use_urlhaus:
+                    uh = urlhaus_host_lookup(d, ABUSECH_KEY)
+                    row["urlhaus_url_count"] = uh.get("urlhaus_url_count", "")
+                    row["urlhaus_spamhaus_dbl"] = uh.get("urlhaus_spamhaus_dbl", "")
+                    row["urlhaus_surbl"] = uh.get("urlhaus_surbl", "")
+                    row["urlhaus_firstseen"] = uh.get("urlhaus_firstseen", "")
+                    time.sleep(0.2)
+
+                # ThreatFox
+                if use_threatfox:
+                    tf = threatfox_search_ioc(d, ABUSECH_KEY)
+                    row.update(tf)
+                    time.sleep(0.2)
+
+                rdap = rdap_lookup(d)
+                row["rdap_registrar"] = rdap.get("registrar", "")
+                row["rdap_created"] = rdap.get("created", "")
+                row["rdap_status"] = rdap.get("status", "")
+
+                w.writerow(row)
 
                 if (
                     op_present == "yes"
                     or (pt_status and pt_status != "not_found")
                     or uh_present == "yes"
+                    or row.get("threatfox_status") == "ok"
                 ):
                     hits += 1
 
@@ -1726,6 +1925,191 @@ def malwarebazaar_lookup(hash_value: str, auth_key: str):
         }
 
 
+# === AbuseIPDB lookup (IPs) ===================================================
+def abuseipdb_check(ip: str, api_key: str) -> dict:
+    empty = {
+        "abuseipdb_score": "",
+        "abuseipdb_reports": "",
+        "abuseipdb_usage": "",
+        "abuseipdb_isp": "",
+        "abuseipdb_country": "",
+        "abuseipdb_is_tor": "",
+        "abuseipdb_last_report": "",
+        "abuseipdb_status": "",
+    }
+    if not api_key:
+        empty["abuseipdb_status"] = "no_key"
+        return empty
+    try:
+        headers = {"Key": api_key, "Accept": "application/json"}
+        params = {"ipAddress": ip, "maxAgeInDays": "90"}
+        r = requests.get(ABUSEIPDB_API_URL, headers=headers, params=params, timeout=20)
+        if r.status_code == 429:
+            return {**empty, "abuseipdb_status": "rate_limited"}
+        if r.status_code != 200:
+            return {**empty, "abuseipdb_status": f"HTTP{r.status_code}"}
+        j = r.json()
+        data = j.get("data", {})
+        return {
+            "abuseipdb_score": str(data.get("abuseConfidenceScore", "")),
+            "abuseipdb_reports": str(data.get("totalReports", "")),
+            "abuseipdb_usage": data.get("usageType", "") or "",
+            "abuseipdb_isp": data.get("isp", "") or "",
+            "abuseipdb_country": data.get("countryCode", "") or "",
+            "abuseipdb_is_tor": str(data.get("isTor", "")).lower(),
+            "abuseipdb_last_report": data.get("lastReportedAt", "") or "",
+            "abuseipdb_status": "ok",
+        }
+    except Exception as e:
+        return {**empty, "abuseipdb_status": f"ERROR:{e}"}
+
+
+# === ThreatFox lookup (IPs/domains) — abuse.ch ================================
+def threatfox_search_ioc(ioc: str, auth_key: str) -> dict:
+    empty = {
+        "threatfox_malware": "",
+        "threatfox_threat_type": "",
+        "threatfox_confidence": "",
+        "threatfox_tags": "",
+        "threatfox_first_seen": "",
+        "threatfox_status": "",
+    }
+    if not auth_key:
+        empty["threatfox_status"] = "no_key"
+        return empty
+    try:
+        headers = {"Auth-Key": auth_key}
+        payload = json.dumps(
+            {"query": "search_ioc", "search_term": ioc, "exact_match": True}
+        )
+        r = requests.post(
+            THREATFOX_API_URL, headers=headers, data=payload, timeout=25
+        )
+        if r.status_code != 200:
+            return {**empty, "threatfox_status": f"HTTP{r.status_code}"}
+        j = r.json()
+        qstatus = (j.get("query_status") or "").lower()
+        if qstatus == "no_result" or not j.get("data"):
+            return {**empty, "threatfox_status": "not_found"}
+        hit = j["data"][0]
+        return {
+            "threatfox_malware": hit.get("malware_printable", "") or "",
+            "threatfox_threat_type": hit.get("threat_type", "") or "",
+            "threatfox_confidence": str(hit.get("confidence_level", "")),
+            "threatfox_tags": ",".join(hit.get("tags") or []),
+            "threatfox_first_seen": hit.get("first_seen", "") or "",
+            "threatfox_status": "ok",
+        }
+    except Exception as e:
+        return {**empty, "threatfox_status": f"ERROR:{e}"}
+
+
+# === ThreatFox hash lookup — abuse.ch =========================================
+def threatfox_search_hash(hash_val: str, auth_key: str) -> dict:
+    empty = {
+        "threatfox_malware": "",
+        "threatfox_threat_type": "",
+        "threatfox_confidence": "",
+        "threatfox_tags": "",
+        "threatfox_ioc": "",
+        "threatfox_status": "",
+    }
+    if not auth_key:
+        empty["threatfox_status"] = "no_key"
+        return empty
+    try:
+        headers = {"Auth-Key": auth_key}
+        payload = json.dumps({"query": "search_hash", "hash": hash_val})
+        r = requests.post(
+            THREATFOX_API_URL, headers=headers, data=payload, timeout=25
+        )
+        if r.status_code != 200:
+            return {**empty, "threatfox_status": f"HTTP{r.status_code}"}
+        j = r.json()
+        qstatus = (j.get("query_status") or "").lower()
+        if qstatus == "no_result" or not j.get("data"):
+            return {**empty, "threatfox_status": "not_found"}
+        hit = j["data"][0]
+        return {
+            "threatfox_malware": hit.get("malware_printable", "") or "",
+            "threatfox_threat_type": hit.get("threat_type", "") or "",
+            "threatfox_confidence": str(hit.get("confidence_level", "")),
+            "threatfox_tags": ",".join(hit.get("tags") or []),
+            "threatfox_ioc": hit.get("ioc", "") or "",
+            "threatfox_status": "ok",
+        }
+    except Exception as e:
+        return {**empty, "threatfox_status": f"ERROR:{e}"}
+
+
+# === URLhaus host lookup (IPs/domains) — abuse.ch =============================
+def urlhaus_host_lookup(host: str, auth_key: str) -> dict:
+    empty = {
+        "urlhaus_url_count": "",
+        "urlhaus_spamhaus_dbl": "",
+        "urlhaus_surbl": "",
+        "urlhaus_firstseen": "",
+        "urlhaus_status": "",
+    }
+    try:
+        headers = {"Auth-Key": auth_key} if auth_key else {}
+        data = {"host": host}
+        r = requests.post(
+            URLHAUS_API_URL + "host/", headers=headers, data=data, timeout=25
+        )
+        if r.status_code != 200:
+            return {**empty, "urlhaus_status": f"HTTP{r.status_code}"}
+        j = r.json()
+        qstatus = (j.get("query_status") or j.get("query_staus") or "").lower()
+        if qstatus in ("no_results", "invalid_host"):
+            return {**empty, "urlhaus_status": "not_found"}
+        bls = j.get("blacklists") or {}
+        return {
+            "urlhaus_url_count": str(j.get("url_count", "") or ""),
+            "urlhaus_spamhaus_dbl": bls.get("spamhaus_dbl", "") or "",
+            "urlhaus_surbl": bls.get("surbl", "") or "",
+            "urlhaus_firstseen": j.get("firstseen", "") or "",
+            "urlhaus_status": "ok",
+        }
+    except Exception as e:
+        return {**empty, "urlhaus_status": f"ERROR:{e}"}
+
+
+# === URLhaus payload lookup (hashes) — abuse.ch ===============================
+def urlhaus_payload_lookup(hash_val: str, auth_key: str) -> dict:
+    empty = {
+        "urlhaus_signature": "",
+        "urlhaus_file_type": "",
+        "urlhaus_firstseen": "",
+        "urlhaus_url_count": "",
+        "urlhaus_status": "",
+    }
+    try:
+        headers = {"Auth-Key": auth_key} if auth_key else {}
+        if len(hash_val) == 32:
+            data = {"md5_hash": hash_val}
+        else:
+            data = {"sha256_hash": hash_val}
+        r = requests.post(
+            URLHAUS_API_URL + "payload/", headers=headers, data=data, timeout=25
+        )
+        if r.status_code != 200:
+            return {**empty, "urlhaus_status": f"HTTP{r.status_code}"}
+        j = r.json()
+        qstatus = (j.get("query_status") or "").lower()
+        if qstatus in ("no_results", "invalid_md5", "invalid_sha256"):
+            return {**empty, "urlhaus_status": qstatus}
+        return {
+            "urlhaus_signature": j.get("signature") or "",
+            "urlhaus_file_type": j.get("file_type") or "",
+            "urlhaus_firstseen": j.get("firstseen") or "",
+            "urlhaus_url_count": str(j.get("url_count", "") or ""),
+            "urlhaus_status": "ok",
+        }
+    except Exception as e:
+        return {**empty, "urlhaus_status": f"ERROR:{e}"}
+
+
 def run_hash_osint_lookup(list_file=None, resume=None):
     path = resolve_hash_list_file(list_file)
     if not os.path.exists(path):
@@ -1738,9 +2122,17 @@ def run_hash_osint_lookup(list_file=None, resume=None):
         print("⚠ No hashes to process." if LANG == "en" else "⚠ Sin hashes a procesar.")
         return
 
-    MBZ_AUTH_KEY = (
-        os.getenv("MBZ_AUTH_KEY") or ""
-    )  # crea tu Auth-Key en abuse.ch (gratis, fair use) [7](blob:https://www.microsoft365.com/ae2b5983-50c6-4317-93c8-fa3b7fc23483)
+    MBZ_AUTH_KEY = os.getenv("MBZ_AUTH_KEY") or ""
+    ABUSECH_KEY = os.getenv("ABUSECH_AUTH_KEY") or MBZ_AUTH_KEY
+    use_threatfox = bool(ABUSECH_KEY)
+    use_urlhaus = True
+
+    if not ABUSECH_KEY:
+        print(
+            "[OSINT] ThreatFox/URLhaus: skipped (set ABUSECH_AUTH_KEY env var to enable)"
+            if LANG == "en"
+            else "[OSINT] ThreatFox/URLhaus: omitido (configura ABUSECH_AUTH_KEY para activar)"
+        )
 
     out_csv = f"{formatted_time}_FILES_HASH_OSINT.csv"
     fields = [
@@ -1751,6 +2143,23 @@ def run_hash_osint_lookup(list_file=None, resume=None):
         "mbz_signature",
         "mbz_status",
     ]
+    if use_threatfox:
+        fields += [
+            "threatfox_malware",
+            "threatfox_threat_type",
+            "threatfox_confidence",
+            "threatfox_tags",
+            "threatfox_ioc",
+            "threatfox_status",
+        ]
+    if use_urlhaus:
+        fields += [
+            "urlhaus_signature",
+            "urlhaus_file_type",
+            "urlhaus_firstseen",
+            "urlhaus_url_count",
+            "urlhaus_status",
+        ]
     start_i = (
         int(resume.get("idx", 0))
         if (resume and resume.get("mode") == "hash_osint")
@@ -1759,6 +2168,9 @@ def run_hash_osint_lookup(list_file=None, resume=None):
     mode = "a" if start_i > 0 else "w"
 
     hits = 0
+    hits_mbz = 0
+    hits_tf = 0
+    hits_uh = 0
     with open(out_csv, mode, newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=fields)
         if start_i == 0:
@@ -1777,9 +2189,34 @@ def run_hash_osint_lookup(list_file=None, resume=None):
                 if MBZ_AUTH_KEY:
                     res = malwarebazaar_lookup(h, MBZ_AUTH_KEY)
                 row = {"hash": h, **res}
-                if row.get("mbz_status") == "ok" and (
+
+                mbz_hit = row.get("mbz_status") == "ok" and (
                     row.get("mbz_family") or row.get("mbz_tags")
-                ):
+                )
+                if mbz_hit:
+                    hits_mbz += 1
+
+                # ThreatFox hash search
+                tf_hit = False
+                if use_threatfox:
+                    tf = threatfox_search_hash(h, ABUSECH_KEY)
+                    row.update(tf)
+                    if tf.get("threatfox_status") == "ok":
+                        tf_hit = True
+                        hits_tf += 1
+                    time.sleep(0.2)
+
+                # URLhaus payload lookup
+                uh_hit = False
+                if use_urlhaus:
+                    uh = urlhaus_payload_lookup(h, ABUSECH_KEY)
+                    row.update(uh)
+                    if uh.get("urlhaus_status") == "ok":
+                        uh_hit = True
+                        hits_uh += 1
+                    time.sleep(0.2)
+
+                if mbz_hit or tf_hit or uh_hit:
                     hits += 1
                 w.writerow(row)
                 save_ckpt(
@@ -1793,12 +2230,22 @@ def run_hash_osint_lookup(list_file=None, resume=None):
             return
     if LANG == "en":
         print(f"\nDone. Output: {out_csv}")
-        print(f"[i] Processed hashes: {len(hashes)} | Matches (family/tags): {hits}")
+        print(f"[i] Processed hashes: {len(hashes)} | Matches (any signal): {hits}")
+        print(f"[i]  - MalwareBazaar: {hits_mbz}")
+        if use_threatfox:
+            print(f"[i]  - ThreatFox    : {hits_tf}")
+        if use_urlhaus:
+            print(f"[i]  - URLhaus      : {hits_uh}")
     else:
         print(f"\nHecho. Salida: {out_csv}")
         print(
-            f"[i] Hashes procesados: {len(hashes)} | Coincidencias (familia/tags): {hits}"
+            f"[i] Hashes procesados: {len(hashes)} | Coincidencias (cualquier señal): {hits}"
         )
+        print(f"[i]  - MalwareBazaar: {hits_mbz}")
+        if use_threatfox:
+            print(f"[i]  - ThreatFox    : {hits_tf}")
+        if use_urlhaus:
+            print(f"[i]  - URLhaus      : {hits_uh}")
     print("\n" + frase_epica_random() + "\n")
 
 
@@ -3607,7 +4054,35 @@ def main():
     select_language()
 
     ssl_status = auto_check_ssl()
-    api_keys = read_lines(API_KEYS_FILE) if os.path.exists(API_KEYS_FILE) else []
+    all_keys = load_api_keys()
+    api_keys = all_keys["VT"]
+
+    # Propagar API keys a variables de entorno (las funciones OSINT las leen de ahí)
+    if all_keys["ABUSEIPDB"]:
+        os.environ.setdefault("ABUSEIPDB_API_KEY", all_keys["ABUSEIPDB"])
+    if all_keys["ABUSECH"]:
+        os.environ.setdefault("ABUSECH_AUTH_KEY", all_keys["ABUSECH"])
+        os.environ.setdefault("MBZ_AUTH_KEY", all_keys["ABUSECH"])
+
+    # Resumen de keys cargadas
+    loaded = ["VT"] if api_keys else []
+    if all_keys["ABUSEIPDB"]:
+        loaded.append("AbuseIPDB")
+    if all_keys["ABUSECH"]:
+        loaded.append("abuse.ch (ThreatFox/URLhaus/MBZ)")
+    if loaded:
+        print(
+            f"[API] Keys loaded: {', '.join(loaded)}"
+            if LANG == "en"
+            else f"[API] Keys cargadas: {', '.join(loaded)}"
+        )
+    else:
+        print(
+            f"[API] ⚠ No keys found in {API_KEYS_FILE}"
+            if LANG == "en"
+            else f"[API] ⚠ No se encontraron keys en {API_KEYS_FILE}"
+        )
+
     selected_fields_ips = ["ip"] + ALL_FIELDS
 
     while True:
