@@ -1,0 +1,22 @@
+# IOCs Of Spades - API keys template
+#
+# Copy this file as IOCS-apikeys.txt and fill in your own keys.
+# Do NOT commit IOCS-apikeys.txt with real secrets.
+#
+# Supported keys:
+# - VT        (VirusTotal)
+# - ABUSEIPDB (AbuseIPDB)
+# - ABUSECH   (ThreatFox / URLhaus / MalwareBazaar)
+# - OTX       (AlienVault OTX)
+#
+# Rotation support:
+# - VT: repeat VT= lines (or legacy lines without prefix)
+# - ABUSEIPDB / ABUSECH / OTX: one or more keys per line,
+#   separated by comma, semicolon, or spaces.
+
+VT=your_vt_key_1
+VT=your_vt_key_2
+
+ABUSEIPDB=your_abuseipdb_key_1,your_abuseipdb_key_2
+ABUSECH=your_abusech_key_1;your_abusech_key_2
+OTX=your_otx_key_1 your_otx_key_2

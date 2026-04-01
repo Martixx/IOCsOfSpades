@@ -1,4 +1,4 @@
-# IOCs of Spades — 1.0 “Lemmy”
+# IOCs of Spades — 2.2 "Lemmy"
 **BORN TO SCAN // LIVE TO WIN**  
 **🤘 Everything louder than everything else 🤘**
 
@@ -47,11 +47,21 @@ SETUP RÁPIDO PARA MANCOS
 ------------------------------------------------------------
 
 1. Crear un archivo llamado IOCS-apikeys.txt en la misma carpeta.
-   Dentro colocar claves de VirusTotal, una por línea:
-       tu_api_key_1
-       tu_api_key_2
+   Puedes copiar la plantilla incluida en el repo:
+      IOCS-apikeys.example.txt
 
-   La herramienta rotará entre ellas automáticamente.
+   Formato recomendado (KEY=valor):
+      VT=tu_vt_key_1
+      VT=tu_vt_key_2
+      ABUSEIPDB=tu_abuseipdb_key_1,tu_abuseipdb_key_2
+      ABUSECH=tu_abusech_key_1,tu_abusech_key_2
+      OTX=tu_otx_key_1,tu_otx_key_2
+
+   Notas:
+   - VT también acepta formato legado sin prefijo (una key por línea).
+   - Para ABUSEIPDB/ABUSECH/OTX puedes usar varias claves separadas por coma,
+    punto y coma o espacios.
+   - Nunca subas IOCS-apikeys.txt con claves reales.
 
 2. (Opcional) Crear archivos de listas:
        iplist.txt
@@ -113,7 +123,8 @@ PREGUNTAS FRECUENTES (FAQ)
    - Archivo IOCS-apikeys.txt con tus claves de VT
 
 2. ¿Dónde pongo las claves de VirusTotal?
-   En IOCS-apikeys.txt, una por línea.
+   En IOCS-apikeys.txt.
+   Revisa la plantilla IOCS-apikeys.example.txt para el formato completo.
 
 3. ¿Necesito iplist.txt / dominios.txt / hashes.txt?
    Opcional. Pueden estar vacíos, pero lo suyo es que consultes IOCs y en algún sitio los tendrás que meter. Digo yo.

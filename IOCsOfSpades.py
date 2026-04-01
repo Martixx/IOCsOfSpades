@@ -44,7 +44,7 @@ import shutil
 
 # === IOCs of Spades — MOTÖRHEAD EDITION ======================================
 APP_NAME = "IOCs of Spades"
-APP_VERSION = '2.1 "Lemmy"'
+APP_VERSION = '2.2 "Lemmy"'
 APP_SHORT = "IOS"
 APP_COPY = " BORN TO SCAN // LIVE TO WIN"
 
@@ -52,7 +52,7 @@ APP_COPY = " BORN TO SCAN // LIVE TO WIN"
 # ACE OF SPADES • KAOS EDITION
 # Anti‑MITM • Anti‑Zscaler • Anti‑ForwardTrust • Anti‑Mancos
 # Full OSINT automation with VirusTotal, PassiveDNS & Tor support
-# Booting IOCs of Spades 2.0 "Lemmy"...
+# Booting IOCs of Spades 2.2 "Lemmy"...
 # Loading core modules... Everything louder than everything else.
 # Dedicated to Lemmy Kilmister — the loudest man that ever lived.
 
@@ -779,9 +779,11 @@ def load_api_keys(path=API_KEYS_FILE):
     """
     Lee IOCS-apikeys.txt con formato CLAVE=valor (una por línea).
     Claves reconocidas: VT, ABUSEIPDB, ABUSECH, OTX.
+    Para ABUSEIPDB/ABUSECH/OTX se permiten múltiples claves por línea
+    separadas por coma/espacio/punto y coma, o repitiendo la misma clave.
     Retrocompatible: línea sin '=' se trata como VT key.
     """
-    keys = {"VT": [], "ABUSEIPDB": "", "ABUSECH": "", "OTX": ""}
+    keys = {"VT": [], "ABUSEIPDB": [], "ABUSECH": [], "OTX": []}
     if not os.path.exists(path):
         return keys
     for line in read_lines(path):
@@ -792,18 +794,58 @@ def load_api_keys(path=API_KEYS_FILE):
             prefix = prefix.strip().upper()
             value = value.strip()
             if prefix == "VT" and value:
-                keys["VT"].append(value)
+                keys["VT"].extend(parse_key_pool(value))
             elif prefix == "ABUSEIPDB" and value:
-                keys["ABUSEIPDB"] = value
+                keys["ABUSEIPDB"].extend(parse_key_pool(value))
             elif prefix == "ABUSECH" and value:
-                keys["ABUSECH"] = value
+                keys["ABUSECH"].extend(parse_key_pool(value))
             elif prefix == "OTX" and value:
-                keys["OTX"] = value
+                keys["OTX"].extend(parse_key_pool(value))
         else:
             # Retrocompatible: línea sin prefijo = VT API key
             if line:
-                keys["VT"].append(line)
+                keys["VT"].extend(parse_key_pool(line))
     return keys
+
+
+def parse_key_pool(raw_value: str) -> list:
+    """
+    Convierte una cadena de claves en lista única, aceptando separadores:
+    coma, punto y coma, espacios y saltos de línea.
+    """
+    if not raw_value:
+        return []
+    parts = re.split(r"[\s,;]+", str(raw_value).strip())
+    out = []
+    seen = set()
+    for p in parts:
+        key = p.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def rotating_lookup(key_pool, idx_ptr, fn_lookup, status_field, rotate_statuses):
+    """
+    Ejecuta fn_lookup(key) rotando por el pool cuando status_field devuelve
+    estados de cuota/bloqueo (ej: rate_limited, forbidden, HTTP429, HTTP403).
+    Devuelve (resultado, nuevo_idx_ptr, agotado_pool).
+    """
+    if not key_pool:
+        return {}, idx_ptr, True
+
+    n = len(key_pool)
+    for tries in range(n):
+        key = key_pool[idx_ptr % n]
+        res = fn_lookup(key)
+        status = str((res or {}).get(status_field, "")).strip().lower()
+        idx_ptr += 1
+        if status not in rotate_statuses:
+            return res, idx_ptr, False
+
+    return res, idx_ptr, True
 
 
 def save_ckpt(data: dict):
@@ -1412,9 +1454,15 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
     osint_toggles = OSINT_IP_SOURCES
 
     # 2.5) API keys para fuentes nuevas
-    ABUSEIPDB_KEY = os.getenv("ABUSEIPDB_API_KEY") or ""
-    ABUSECH_KEY = os.getenv("ABUSECH_AUTH_KEY") or os.getenv("MBZ_AUTH_KEY") or ""
-    OTX_KEY = os.getenv("OTX_API_KEY") or ""
+    abuseipdb_keys = parse_key_pool(os.getenv("ABUSEIPDB_API_KEY") or "")
+    abusech_keys = parse_key_pool(
+        os.getenv("ABUSECH_AUTH_KEY") or os.getenv("MBZ_AUTH_KEY") or ""
+    )
+    otx_keys = parse_key_pool(os.getenv("OTX_API_KEY") or "")
+
+    ABUSEIPDB_KEY = abuseipdb_keys[0] if abuseipdb_keys else ""
+    ABUSECH_KEY = abusech_keys[0] if abusech_keys else ""
+    OTX_KEY = otx_keys[0] if otx_keys else ""
     use_abuseipdb = osint_toggles.get("abuseipdb", True) and bool(ABUSEIPDB_KEY)
     use_threatfox = osint_toggles.get("threatfox", True) and bool(ABUSECH_KEY)
     use_urlhaus = osint_toggles.get("urlhaus", True)
@@ -1445,7 +1493,11 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
     blkde = load_blocklistde_set() if osint_toggles.get("blocklistde", True) else set()
     feodo = load_feodo_set() if osint_toggles.get("feodo", True) else set()
     cinsscore = load_cinsscore_set() if osint_toggles.get("cinsscore", True) else set()
-    et_comp = load_et_compromised_set() if osint_toggles.get("et_compromised", True) else set()
+    et_comp = (
+        load_et_compromised_set()
+        if osint_toggles.get("et_compromised", True)
+        else set()
+    )
 
     print(
         f"[OSINT] Feeds loaded → DShield:/24={len(dshield)}  blocklist.de={len(blkde)}  ASN-DROP={len(asn_drop)}  Feodo={len(feodo)}  CINSscore={len(cinsscore)}  ET={len(et_comp)}"
@@ -1577,7 +1629,14 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
     hits_feodo = 0
     hits_cinsscore = 0
     hits_et = 0
-    abuseipdb_rate_limited = False
+    abuseipdb_pool_exhausted = False
+    threatfox_pool_exhausted = False
+    urlhaus_pool_exhausted = False
+    otx_pool_exhausted = False
+    idx_abuseipdb = 0
+    idx_threatfox = 0
+    idx_urlhaus = 0
+    idx_otx = 0
 
     # 6) Procesado
     with open(out_csv, mode, newline="", encoding="utf-8") as fh:
@@ -1659,32 +1718,61 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                     row["asn_drop_source"] = ""
 
                 # AbuseIPDB (API per-IP)
-                if use_abuseipdb and not abuseipdb_rate_limited:
-                    ab = abuseipdb_check(ip, ABUSEIPDB_KEY)
+                if use_abuseipdb and not abuseipdb_pool_exhausted:
+                    ab, idx_abuseipdb, abuseipdb_pool_exhausted = rotating_lookup(
+                        abuseipdb_keys,
+                        idx_abuseipdb,
+                        lambda k: abuseipdb_check(ip, k),
+                        "abuseipdb_status",
+                        {"rate_limited", "forbidden", "http429", "http403"},
+                    )
                     row.update(ab)
-                    if ab.get("abuseipdb_status") == "rate_limited":
-                        abuseipdb_rate_limited = True
+                    if abuseipdb_pool_exhausted:
                         print(
-                            "\n[OSINT] ⚠ AbuseIPDB rate limit reached — disabling for remaining IPs."
+                            "\n[OSINT] ⚠ AbuseIPDB key pool exhausted (rate-limit/forbidden) — disabling for remaining IPs."
                             if LANG == "en"
-                            else "\n[OSINT] ⚠ AbuseIPDB límite alcanzado — desactivando para las IPs restantes."
+                            else "\n[OSINT] ⚠ Pool de claves AbuseIPDB agotado (límite/bloqueo) — desactivando para las IPs restantes."
                         )
                     elif ab.get("abuseipdb_score") and int(ab["abuseipdb_score"]) > 0:
                         hits_abuseipdb += 1
                     time.sleep(0.3)
 
                 # ThreatFox (API per-IP)
-                if use_threatfox:
-                    tf = threatfox_search_ioc(ip, ABUSECH_KEY)
+                if use_threatfox and not threatfox_pool_exhausted:
+                    tf, idx_threatfox, threatfox_pool_exhausted = rotating_lookup(
+                        abusech_keys,
+                        idx_threatfox,
+                        lambda k: threatfox_search_ioc(ip, k),
+                        "threatfox_status",
+                        {"rate_limited", "forbidden", "http429", "http403"},
+                    )
                     row.update(tf)
+                    if threatfox_pool_exhausted:
+                        print(
+                            "\n[OSINT] ⚠ ThreatFox key pool exhausted (rate-limit/forbidden) — disabling for remaining IPs."
+                            if LANG == "en"
+                            else "\n[OSINT] ⚠ Pool de claves ThreatFox agotado (límite/bloqueo) — desactivando para las IPs restantes."
+                        )
                     if tf.get("threatfox_status") == "ok":
                         hits_threatfox += 1
                     time.sleep(0.2)
 
                 # URLhaus (API per-IP)
-                if use_urlhaus:
-                    uh = urlhaus_host_lookup(ip, ABUSECH_KEY)
+                if use_urlhaus and not urlhaus_pool_exhausted:
+                    uh, idx_urlhaus, urlhaus_pool_exhausted = rotating_lookup(
+                        abusech_keys,
+                        idx_urlhaus,
+                        lambda k: urlhaus_host_lookup(ip, k),
+                        "urlhaus_status",
+                        {"rate_limited", "forbidden", "http429", "http403"},
+                    )
                     row.update(uh)
+                    if urlhaus_pool_exhausted:
+                        print(
+                            "\n[OSINT] ⚠ URLhaus key pool exhausted (rate-limit/forbidden) — disabling for remaining IPs."
+                            if LANG == "en"
+                            else "\n[OSINT] ⚠ Pool de claves URLhaus agotado (límite/bloqueo) — desactivando para las IPs restantes."
+                        )
                     if (
                         uh.get("urlhaus_status") == "ok"
                         and uh.get("urlhaus_url_count", "0") != "0"
@@ -1693,9 +1781,21 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                     time.sleep(0.2)
 
                 # OTX AlienVault (API per-IP)
-                if use_otx:
-                    otx = otx_ip_lookup(ip, OTX_KEY)
+                if use_otx and not otx_pool_exhausted:
+                    otx, idx_otx, otx_pool_exhausted = rotating_lookup(
+                        otx_keys,
+                        idx_otx,
+                        lambda k: otx_ip_lookup(ip, k),
+                        "otx_status",
+                        {"rate_limited", "forbidden", "http429", "http403"},
+                    )
                     row.update(otx)
+                    if otx_pool_exhausted:
+                        print(
+                            "\n[OSINT] ⚠ OTX key pool exhausted (rate-limit/forbidden) — disabling for remaining IPs."
+                            if LANG == "en"
+                            else "\n[OSINT] ⚠ Pool de claves OTX agotado (límite/bloqueo) — desactivando para las IPs restantes."
+                        )
                     if (
                         otx.get("otx_status") == "ok"
                         and otx.get("otx_pulses", "0") != "0"
@@ -1961,11 +2061,17 @@ def run_domain_osint_lookup(list_file: str = DOMAIN_LIST_FILE, resume=None):
 
     # Carga feeds/contexto
     dom_toggles = OSINT_DOMAIN_SOURCES
-    openphish_hosts = load_openphish_hosts() if dom_toggles.get("openphish", True) else set()
+    openphish_hosts = (
+        load_openphish_hosts() if dom_toggles.get("openphish", True) else set()
+    )
     # opcionales por clave:
     PHISHTANK_APP_KEY = os.getenv("PHISHTANK_APP_KEY") or ""
-    ABUSECH_KEY = os.getenv("ABUSECH_AUTH_KEY") or os.getenv("MBZ_AUTH_KEY") or ""
-    OTX_KEY = os.getenv("OTX_API_KEY") or ""
+    ABUSECH_KEYS = parse_key_pool(
+        os.getenv("ABUSECH_AUTH_KEY") or os.getenv("MBZ_AUTH_KEY") or ""
+    )
+    OTX_KEYS = parse_key_pool(os.getenv("OTX_API_KEY") or "")
+    ABUSECH_KEY = ABUSECH_KEYS[0] if ABUSECH_KEYS else ""
+    OTX_KEY = OTX_KEYS[0] if OTX_KEYS else ""
     use_openphish = dom_toggles.get("openphish", True)
     use_phishtank = dom_toggles.get("phishtank", True)
     use_threatfox = dom_toggles.get("threatfox", True) and bool(ABUSECH_KEY)
@@ -2491,9 +2597,12 @@ def run_hash_osint_lookup(list_file=None, resume=None):
         return
 
     hash_toggles = OSINT_HASH_SOURCES
-    MBZ_AUTH_KEY = os.getenv("MBZ_AUTH_KEY") or ""
-    ABUSECH_KEY = os.getenv("ABUSECH_AUTH_KEY") or MBZ_AUTH_KEY
-    OTX_KEY = os.getenv("OTX_API_KEY") or ""
+    MBZ_KEYS = parse_key_pool(os.getenv("MBZ_AUTH_KEY") or "")
+    ABUSECH_KEYS = parse_key_pool(os.getenv("ABUSECH_AUTH_KEY") or "")
+    OTX_KEYS = parse_key_pool(os.getenv("OTX_API_KEY") or "")
+    MBZ_AUTH_KEY = MBZ_KEYS[0] if MBZ_KEYS else ""
+    ABUSECH_KEY = ABUSECH_KEYS[0] if ABUSECH_KEYS else MBZ_AUTH_KEY
+    OTX_KEY = OTX_KEYS[0] if OTX_KEYS else ""
     use_malwarebazaar = hash_toggles.get("malwarebazaar", True) and bool(MBZ_AUTH_KEY)
     use_threatfox = hash_toggles.get("threatfox", True) and bool(ABUSECH_KEY)
     use_urlhaus = hash_toggles.get("urlhaus", True)
@@ -4030,56 +4139,56 @@ def osint_config_menu():
 
     _LABELS = {
         # IP sources
-        "dshield":        "DShield       (IP)",
-        "blocklistde":    "blocklist.de  (IP)",
-        "asn_drop":       "ASN-DROP      (IP)",
-        "feodo":          "Feodo Tracker (IP)",
-        "cinsscore":      "CINSscore     (IP)",
+        "dshield": "DShield       (IP)",
+        "blocklistde": "blocklist.de  (IP)",
+        "asn_drop": "ASN-DROP      (IP)",
+        "feodo": "Feodo Tracker (IP)",
+        "cinsscore": "CINSscore     (IP)",
         "et_compromised": "ET Compromised(IP)",
-        "abuseipdb":      "AbuseIPDB     (IP)  [API key]",
+        "abuseipdb": "AbuseIPDB     (IP)  [API key]",
         # IP+Domain+Hash shared
-        "threatfox_ip":   "ThreatFox     (IP)  [API key]",
-        "urlhaus_ip":     "URLhaus       (IP)",
-        "otx_ip":         "OTX AlienVault(IP)  [API key]",
+        "threatfox_ip": "ThreatFox     (IP)  [API key]",
+        "urlhaus_ip": "URLhaus       (IP)",
+        "otx_ip": "OTX AlienVault(IP)  [API key]",
         # Domain sources
-        "openphish":      "OpenPhish     (Dom)",
-        "phishtank":      "PhishTank     (Dom)",
-        "urlhaus_dom":    "URLhaus       (Dom)",
-        "threatfox_dom":  "ThreatFox     (Dom) [API key]",
-        "otx_dom":        "OTX AlienVault(Dom) [API key]",
-        "rdap":           "RDAP/Whois    (Dom)",
+        "openphish": "OpenPhish     (Dom)",
+        "phishtank": "PhishTank     (Dom)",
+        "urlhaus_dom": "URLhaus       (Dom)",
+        "threatfox_dom": "ThreatFox     (Dom) [API key]",
+        "otx_dom": "OTX AlienVault(Dom) [API key]",
+        "rdap": "RDAP/Whois    (Dom)",
         # Hash sources
-        "malwarebazaar":  "MalwareBazaar (Hash)[API key]",
+        "malwarebazaar": "MalwareBazaar (Hash)[API key]",
         "threatfox_hash": "ThreatFox     (Hash)[API key]",
-        "urlhaus_hash":   "URLhaus       (Hash)",
-        "otx_hash":       "OTX AlienVault(Hash)[API key]",
+        "urlhaus_hash": "URLhaus       (Hash)",
+        "otx_hash": "OTX AlienVault(Hash)[API key]",
     }
 
     # Flat ordered list: (display_label, dict_ref, key_in_dict)
     _ENTRIES = [
         # --- IP ---
-        ("dshield",        OSINT_IP_SOURCES,     "dshield"),
-        ("blocklistde",    OSINT_IP_SOURCES,     "blocklistde"),
-        ("asn_drop",       OSINT_IP_SOURCES,     "asn_drop"),
-        ("feodo",          OSINT_IP_SOURCES,     "feodo"),
-        ("cinsscore",      OSINT_IP_SOURCES,     "cinsscore"),
-        ("et_compromised", OSINT_IP_SOURCES,     "et_compromised"),
-        ("abuseipdb",      OSINT_IP_SOURCES,     "abuseipdb"),
-        ("threatfox_ip",   OSINT_IP_SOURCES,     "threatfox"),
-        ("urlhaus_ip",     OSINT_IP_SOURCES,     "urlhaus"),
-        ("otx_ip",         OSINT_IP_SOURCES,     "otx"),
+        ("dshield", OSINT_IP_SOURCES, "dshield"),
+        ("blocklistde", OSINT_IP_SOURCES, "blocklistde"),
+        ("asn_drop", OSINT_IP_SOURCES, "asn_drop"),
+        ("feodo", OSINT_IP_SOURCES, "feodo"),
+        ("cinsscore", OSINT_IP_SOURCES, "cinsscore"),
+        ("et_compromised", OSINT_IP_SOURCES, "et_compromised"),
+        ("abuseipdb", OSINT_IP_SOURCES, "abuseipdb"),
+        ("threatfox_ip", OSINT_IP_SOURCES, "threatfox"),
+        ("urlhaus_ip", OSINT_IP_SOURCES, "urlhaus"),
+        ("otx_ip", OSINT_IP_SOURCES, "otx"),
         # --- Domain ---
-        ("openphish",      OSINT_DOMAIN_SOURCES, "openphish"),
-        ("phishtank",      OSINT_DOMAIN_SOURCES, "phishtank"),
-        ("urlhaus_dom",    OSINT_DOMAIN_SOURCES, "urlhaus"),
-        ("threatfox_dom",  OSINT_DOMAIN_SOURCES, "threatfox"),
-        ("otx_dom",        OSINT_DOMAIN_SOURCES, "otx"),
-        ("rdap",           OSINT_DOMAIN_SOURCES, "rdap"),
+        ("openphish", OSINT_DOMAIN_SOURCES, "openphish"),
+        ("phishtank", OSINT_DOMAIN_SOURCES, "phishtank"),
+        ("urlhaus_dom", OSINT_DOMAIN_SOURCES, "urlhaus"),
+        ("threatfox_dom", OSINT_DOMAIN_SOURCES, "threatfox"),
+        ("otx_dom", OSINT_DOMAIN_SOURCES, "otx"),
+        ("rdap", OSINT_DOMAIN_SOURCES, "rdap"),
         # --- Hash ---
-        ("malwarebazaar",  OSINT_HASH_SOURCES,   "malwarebazaar"),
-        ("threatfox_hash", OSINT_HASH_SOURCES,   "threatfox"),
-        ("urlhaus_hash",   OSINT_HASH_SOURCES,   "urlhaus"),
-        ("otx_hash",       OSINT_HASH_SOURCES,   "otx"),
+        ("malwarebazaar", OSINT_HASH_SOURCES, "malwarebazaar"),
+        ("threatfox_hash", OSINT_HASH_SOURCES, "threatfox"),
+        ("urlhaus_hash", OSINT_HASH_SOURCES, "urlhaus"),
+        ("otx_hash", OSINT_HASH_SOURCES, "otx"),
     ]
 
     while True:
@@ -4138,17 +4247,9 @@ def osint_config_menu():
                     new_state = "ON" if dref[dkey] else "OFF"
                     print(f"\n  {_LABELS[lbl_key]}  →  [{new_state}]")
                 else:
-                    print(
-                        "Invalid number."
-                        if LANG == "en"
-                        else "Número no válido."
-                    )
+                    print("Invalid number." if LANG == "en" else "Número no válido.")
             except ValueError:
-                print(
-                    "Invalid option."
-                    if LANG == "en"
-                    else "Opción no válida."
-                )
+                print("Invalid option." if LANG == "en" else "Opción no válida.")
 
 
 # === Menús (con estado SSL visible)
@@ -4595,12 +4696,12 @@ def main():
 
     # Propagar API keys a variables de entorno (las funciones OSINT las leen de ahí)
     if all_keys["ABUSEIPDB"]:
-        os.environ.setdefault("ABUSEIPDB_API_KEY", all_keys["ABUSEIPDB"])
+        os.environ.setdefault("ABUSEIPDB_API_KEY", ",".join(all_keys["ABUSEIPDB"]))
     if all_keys["ABUSECH"]:
-        os.environ.setdefault("ABUSECH_AUTH_KEY", all_keys["ABUSECH"])
-        os.environ.setdefault("MBZ_AUTH_KEY", all_keys["ABUSECH"])
+        os.environ.setdefault("ABUSECH_AUTH_KEY", ",".join(all_keys["ABUSECH"]))
+        os.environ.setdefault("MBZ_AUTH_KEY", all_keys["ABUSECH"][0])
     if all_keys["OTX"]:
-        os.environ.setdefault("OTX_API_KEY", all_keys["OTX"])
+        os.environ.setdefault("OTX_API_KEY", ",".join(all_keys["OTX"]))
 
     # Resumen de keys cargadas
     loaded = ["VT"] if api_keys else []
