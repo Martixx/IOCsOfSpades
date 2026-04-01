@@ -1,0 +1,62 @@
+# === Python caches ============================================================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+
+# === IOC input files (NEVER upload real data) =================================
+list_ip.txt
+list_domains.txt
+list_hashes.txt
+IOCS-apikeys.txt
+
+# Legacy names (just in case)
+iplist.txt
+dominios.txt
+hashes.txt
+
+# === Output files =============================================================
+results/
+*.csv
+*.json
+*.sqlite
+*.zip
+*.gz
+
+# === OSINT cache / runtime data ==============================================
+.osint_cache/
+*.cache
+*.tmp
+*.log
+*.db
+*.progress
+*.checkpoint
+*.ckpt
+
+# === API Keys / Secrets =======================================================
+apikeys.txt
+*.key
+*.secret
+*.token
+
+# === Editor / IDE folders =====================================================
+.vscode/
+.idea/
+
+# === OS-specific trash ========================================================
+# macOS
+.DS_Store
+# Windows
+Thumbs.db
+desktop.ini
+
+# === Virtual environments =====================================================
+venv/
+env/
+.venv/
+
+# === Viejuneces ===============================================================
+
+IOCsOfSpades0.py
+IOCsOfSpades_v1.py
