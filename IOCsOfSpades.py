@@ -1463,6 +1463,7 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
     ABUSEIPDB_KEY = abuseipdb_keys[0] if abuseipdb_keys else ""
     ABUSECH_KEY = abusech_keys[0] if abusech_keys else ""
     OTX_KEY = otx_keys[0] if otx_keys else ""
+    API_COOLDOWN_S = _get_int_env("API_COOLDOWN_S", 3600)
     use_abuseipdb = osint_toggles.get("abuseipdb", True) and bool(ABUSEIPDB_KEY)
     use_threatfox = osint_toggles.get("threatfox", True) and bool(ABUSECH_KEY)
     use_urlhaus = osint_toggles.get("urlhaus", True)
@@ -1633,6 +1634,10 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
     threatfox_pool_exhausted = False
     urlhaus_pool_exhausted = False
     otx_pool_exhausted = False
+    abuseipdb_retry_at = 0.0
+    threatfox_retry_at = 0.0
+    urlhaus_retry_at = 0.0
+    otx_retry_at = 0.0
     idx_abuseipdb = 0
     idx_threatfox = 0
     idx_urlhaus = 0
@@ -1659,6 +1664,66 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                     "bl_cinsscore": "no",
                     "bl_et_compromised": "no",
                 }
+
+                # Si TODAS las fuentes API activas están en cooldown, pausar automáticamente.
+                now = time.time()
+                api_states = []
+                if use_abuseipdb:
+                    api_states.append((abuseipdb_pool_exhausted, abuseipdb_retry_at))
+                if use_threatfox:
+                    api_states.append((threatfox_pool_exhausted, threatfox_retry_at))
+                if use_urlhaus:
+                    api_states.append((urlhaus_pool_exhausted, urlhaus_retry_at))
+                if use_otx:
+                    api_states.append((otx_pool_exhausted, otx_retry_at))
+
+                if api_states and all(st[0] for st in api_states):
+                    next_retry = min(st[1] for st in api_states)
+                    wait_s = max(0, int(next_retry - now))
+                    if wait_s > 0:
+                        if LANG == "en":
+                            print(
+                                f"\n[OSINT] ⏸ All API sources in cooldown. Sleeping {wait_s}s and auto-resuming..."
+                            )
+                        else:
+                            print(
+                                f"\n[OSINT] ⏸ Todas las APIs en cooldown. Pausando {wait_s}s y reanudando automáticamente..."
+                            )
+                        time.sleep(wait_s)
+
+                now = time.time()
+                if (
+                    use_abuseipdb
+                    and abuseipdb_pool_exhausted
+                    and now >= abuseipdb_retry_at
+                ):
+                    abuseipdb_pool_exhausted = False
+                    if LANG == "en":
+                        print("[OSINT] ↻ Retrying AbuseIPDB after cooldown.")
+                    else:
+                        print("[OSINT] ↻ Reintentando AbuseIPDB tras cooldown.")
+                if (
+                    use_threatfox
+                    and threatfox_pool_exhausted
+                    and now >= threatfox_retry_at
+                ):
+                    threatfox_pool_exhausted = False
+                    if LANG == "en":
+                        print("[OSINT] ↻ Retrying ThreatFox after cooldown.")
+                    else:
+                        print("[OSINT] ↻ Reintentando ThreatFox tras cooldown.")
+                if use_urlhaus and urlhaus_pool_exhausted and now >= urlhaus_retry_at:
+                    urlhaus_pool_exhausted = False
+                    if LANG == "en":
+                        print("[OSINT] ↻ Retrying URLhaus after cooldown.")
+                    else:
+                        print("[OSINT] ↻ Reintentando URLhaus tras cooldown.")
+                if use_otx and otx_pool_exhausted and now >= otx_retry_at:
+                    otx_pool_exhausted = False
+                    if LANG == "en":
+                        print("[OSINT] ↻ Retrying OTX after cooldown.")
+                    else:
+                        print("[OSINT] ↻ Reintentando OTX tras cooldown.")
 
                 # DShield: si la IP cae en uno de los rangos /24 top de 3 días
                 if dshield:
@@ -1728,10 +1793,11 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                     )
                     row.update(ab)
                     if abuseipdb_pool_exhausted:
+                        abuseipdb_retry_at = time.time() + API_COOLDOWN_S
                         print(
-                            "\n[OSINT] ⚠ AbuseIPDB key pool exhausted (rate-limit/forbidden) — disabling for remaining IPs."
+                            f"\n[OSINT] ⚠ AbuseIPDB key pool exhausted (rate-limit/forbidden) — cooling down {API_COOLDOWN_S}s."
                             if LANG == "en"
-                            else "\n[OSINT] ⚠ Pool de claves AbuseIPDB agotado (límite/bloqueo) — desactivando para las IPs restantes."
+                            else f"\n[OSINT] ⚠ Pool de claves AbuseIPDB agotado (límite/bloqueo) — cooldown {API_COOLDOWN_S}s."
                         )
                     elif ab.get("abuseipdb_score") and int(ab["abuseipdb_score"]) > 0:
                         hits_abuseipdb += 1
@@ -1748,10 +1814,11 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                     )
                     row.update(tf)
                     if threatfox_pool_exhausted:
+                        threatfox_retry_at = time.time() + API_COOLDOWN_S
                         print(
-                            "\n[OSINT] ⚠ ThreatFox key pool exhausted (rate-limit/forbidden) — disabling for remaining IPs."
+                            f"\n[OSINT] ⚠ ThreatFox key pool exhausted (rate-limit/forbidden) — cooling down {API_COOLDOWN_S}s."
                             if LANG == "en"
-                            else "\n[OSINT] ⚠ Pool de claves ThreatFox agotado (límite/bloqueo) — desactivando para las IPs restantes."
+                            else f"\n[OSINT] ⚠ Pool de claves ThreatFox agotado (límite/bloqueo) — cooldown {API_COOLDOWN_S}s."
                         )
                     if tf.get("threatfox_status") == "ok":
                         hits_threatfox += 1
@@ -1768,10 +1835,11 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                     )
                     row.update(uh)
                     if urlhaus_pool_exhausted:
+                        urlhaus_retry_at = time.time() + API_COOLDOWN_S
                         print(
-                            "\n[OSINT] ⚠ URLhaus key pool exhausted (rate-limit/forbidden) — disabling for remaining IPs."
+                            f"\n[OSINT] ⚠ URLhaus key pool exhausted (rate-limit/forbidden) — cooling down {API_COOLDOWN_S}s."
                             if LANG == "en"
-                            else "\n[OSINT] ⚠ Pool de claves URLhaus agotado (límite/bloqueo) — desactivando para las IPs restantes."
+                            else f"\n[OSINT] ⚠ Pool de claves URLhaus agotado (límite/bloqueo) — cooldown {API_COOLDOWN_S}s."
                         )
                     if (
                         uh.get("urlhaus_status") == "ok"
@@ -1791,10 +1859,11 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                     )
                     row.update(otx)
                     if otx_pool_exhausted:
+                        otx_retry_at = time.time() + API_COOLDOWN_S
                         print(
-                            "\n[OSINT] ⚠ OTX key pool exhausted (rate-limit/forbidden) — disabling for remaining IPs."
+                            f"\n[OSINT] ⚠ OTX key pool exhausted (rate-limit/forbidden) — cooling down {API_COOLDOWN_S}s."
                             if LANG == "en"
-                            else "\n[OSINT] ⚠ Pool de claves OTX agotado (límite/bloqueo) — desactivando para las IPs restantes."
+                            else f"\n[OSINT] ⚠ Pool de claves OTX agotado (límite/bloqueo) — cooldown {API_COOLDOWN_S}s."
                         )
                     if (
                         otx.get("otx_status") == "ok"
