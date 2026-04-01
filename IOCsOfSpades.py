@@ -742,10 +742,10 @@ def read_lines(path):
 def load_api_keys(path=API_KEYS_FILE):
     """
     Lee IOCS-apikeys.txt con formato CLAVE=valor (una por línea).
-    Claves reconocidas: VT, ABUSEIPDB, ABUSECH.
+    Claves reconocidas: VT, ABUSEIPDB, ABUSECH, OTX.
     Retrocompatible: línea sin '=' se trata como VT key.
     """
-    keys = {"VT": [], "ABUSEIPDB": "", "ABUSECH": ""}
+    keys = {"VT": [], "ABUSEIPDB": "", "ABUSECH": "", "OTX": ""}
     if not os.path.exists(path):
         return keys
     for line in read_lines(path):
@@ -761,6 +761,8 @@ def load_api_keys(path=API_KEYS_FILE):
                 keys["ABUSEIPDB"] = value
             elif prefix == "ABUSECH" and value:
                 keys["ABUSECH"] = value
+            elif prefix == "OTX" and value:
+                keys["OTX"] = value
         else:
             # Retrocompatible: línea sin prefijo = VT API key
             if line:
@@ -1028,6 +1030,9 @@ THREATFOX_API_URL = "https://threatfox-api.abuse.ch/api/v1/"
 
 # === URLhaus API (hosts, payloads) — abuse.ch =================================
 URLHAUS_API_URL = "https://urlhaus-api.abuse.ch/v1/"
+
+# === OTX AlienVault API (IPs, domains, hashes) ================================
+OTX_API_URL = "https://otx.alienvault.com/api/v1/indicators"
 
 
 def load_asn_drop_set():
@@ -1315,15 +1320,18 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
             "abuseipdb": True,
             "threatfox": True,
             "urlhaus": True,
+            "otx": True,
         },
     )
 
     # 2.5) API keys para fuentes nuevas
     ABUSEIPDB_KEY = os.getenv("ABUSEIPDB_API_KEY") or ""
     ABUSECH_KEY = os.getenv("ABUSECH_AUTH_KEY") or os.getenv("MBZ_AUTH_KEY") or ""
+    OTX_KEY = os.getenv("OTX_API_KEY") or ""
     use_abuseipdb = osint_toggles.get("abuseipdb", True) and bool(ABUSEIPDB_KEY)
     use_threatfox = osint_toggles.get("threatfox", True) and bool(ABUSECH_KEY)
     use_urlhaus = osint_toggles.get("urlhaus", True)
+    use_otx = osint_toggles.get("otx", True) and bool(OTX_KEY)
 
     if osint_toggles.get("abuseipdb", True) and not ABUSEIPDB_KEY:
         print(
@@ -1336,6 +1344,12 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
             "[OSINT] ThreatFox: skipped (set ABUSECH_AUTH_KEY env var to enable)"
             if LANG == "en"
             else "[OSINT] ThreatFox: omitido (configura ABUSECH_AUTH_KEY para activar)"
+        )
+    if osint_toggles.get("otx", True) and not OTX_KEY:
+        print(
+            "[OSINT] OTX: skipped (set OTX_API_KEY env var or OTX= in apikeys file)"
+            if LANG == "en"
+            else "[OSINT] OTX: omitido (configura OTX= en el fichero de apikeys)"
         )
 
     # 3) Carga de feeds (respetando toggles)
@@ -1355,6 +1369,8 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
         api_sources.append("ThreatFox")
     if use_urlhaus:
         api_sources.append("URLhaus")
+    if use_otx:
+        api_sources.append("OTX")
     if api_sources:
         print(
             f"[OSINT] API sources enabled: {', '.join(api_sources)}"
@@ -1406,6 +1422,7 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
     out_csv = f"{formatted_time}_ULTRA_OSINT.csv"
     fields = [
         "ip",
+        "verdict",
         "asn_drop",
         "asn_drop_source",
         "bl_dshield_24",
@@ -1440,6 +1457,14 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
             "urlhaus_firstseen",
             "urlhaus_status",
         ]
+    if use_otx:
+        fields += [
+            "otx_pulses",
+            "otx_reputation",
+            "otx_country",
+            "otx_asn",
+            "otx_status",
+        ]
     start_i = (
         int(resume.get("idx", 0))
         if (resume and resume.get("mode") == "ip_osint")
@@ -1455,6 +1480,7 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
     hits_abuseipdb = 0
     hits_threatfox = 0
     hits_urlhaus = 0
+    hits_otx = 0
     abuseipdb_rate_limited = False
 
     # 6) Procesado
@@ -1545,8 +1571,22 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                 if use_urlhaus:
                     uh = urlhaus_host_lookup(ip, ABUSECH_KEY)
                     row.update(uh)
-                    if uh.get("urlhaus_status") == "ok" and uh.get("urlhaus_url_count", "0") != "0":
+                    if (
+                        uh.get("urlhaus_status") == "ok"
+                        and uh.get("urlhaus_url_count", "0") != "0"
+                    ):
                         hits_urlhaus += 1
+                    time.sleep(0.2)
+
+                # OTX AlienVault (API per-IP)
+                if use_otx:
+                    otx = otx_ip_lookup(ip, OTX_KEY)
+                    row.update(otx)
+                    if (
+                        otx.get("otx_status") == "ok"
+                        and otx.get("otx_pulses", "0") != "0"
+                    ):
+                        hits_otx += 1
                     time.sleep(0.2)
 
                 # ¿Alguna señal?
@@ -1554,11 +1594,54 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                     row["bl_dshield_24"] == "yes"
                     or row["bl_blocklistde_48h"] == "yes"
                     or row["asn_drop"] == "yes"
-                    or (row.get("abuseipdb_score") and row["abuseipdb_score"] not in ("", "0"))
+                    or (
+                        row.get("abuseipdb_score")
+                        and row["abuseipdb_score"] not in ("", "0")
+                    )
                     or row.get("threatfox_status") == "ok"
-                    or (row.get("urlhaus_status") == "ok" and row.get("urlhaus_url_count", "0") != "0")
+                    or (
+                        row.get("urlhaus_status") == "ok"
+                        and row.get("urlhaus_url_count", "0") != "0"
+                    )
+                    or (
+                        row.get("otx_status") == "ok"
+                        and row.get("otx_pulses", "0") != "0"
+                    )
                 ):
                     hits_any += 1
+
+                # Verdict
+                _mal = (
+                    row["asn_drop"] == "yes"
+                    or row["bl_blocklistde_48h"] == "yes"
+                    or row.get("threatfox_status") == "ok"
+                    or (
+                        row.get("urlhaus_status") == "ok"
+                        and row.get("urlhaus_url_count", "0") not in ("", "0")
+                    )
+                    or (
+                        row.get("abuseipdb_score")
+                        and row["abuseipdb_score"].isdigit()
+                        and int(row["abuseipdb_score"]) >= 75
+                    )
+                )
+                _sus = not _mal and (
+                    row["bl_dshield_24"] == "yes"
+                    or (
+                        row.get("abuseipdb_score")
+                        and row["abuseipdb_score"].isdigit()
+                        and int(row["abuseipdb_score"]) >= 25
+                    )
+                    or (
+                        row.get("otx_pulses")
+                        and row["otx_pulses"].isdigit()
+                        and int(row["otx_pulses"]) >= 5
+                    )
+                    or row.get("abuseipdb_is_tor") == "true"
+                )
+                row["verdict"] = (
+                    "malicious" if _mal else "suspicious" if _sus else "clean"
+                )
 
                 w.writerow(row)
                 save_ckpt({"mode": "ip_osint", "idx": i + 1, "timestamp": time.time()})
@@ -1583,6 +1666,8 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
             print(f"[i]  - ThreatFox    : {hits_threatfox}")
         if use_urlhaus:
             print(f"[i]  - URLhaus      : {hits_urlhaus}")
+        if use_otx:
+            print(f"[i]  - OTX          : {hits_otx}")
         print()
     else:
         print(f"\nHecho. Salida: {out_csv}")
@@ -1598,6 +1683,8 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
             print(f"[i]  - ThreatFox    : {hits_threatfox}")
         if use_urlhaus:
             print(f"[i]  - URLhaus      : {hits_urlhaus}")
+        if use_otx:
+            print(f"[i]  - OTX          : {hits_otx}")
         print()
     print("\n" + frase_epica_random() + "\n")
 
@@ -1716,7 +1803,10 @@ def rdap_lookup(domain: str):
 # URLhaus (opcional: requiere Auth-Key para bulk fiable)
 def urlhaus_present_for_domain(domain: str, auth_key: str = None):
     result = urlhaus_host_lookup(domain, auth_key or "")
-    if result.get("urlhaus_status") == "ok" and result.get("urlhaus_url_count", "0") != "0":
+    if (
+        result.get("urlhaus_status") == "ok"
+        and result.get("urlhaus_url_count", "0") != "0"
+    ):
         return "yes"
     return "no" if result.get("urlhaus_status") in ("ok", "not_found") else ""
 
@@ -1748,8 +1838,10 @@ def run_domain_osint_lookup(list_file: str = DOMAIN_LIST_FILE, resume=None):
     # opcionales por clave:
     PHISHTANK_APP_KEY = os.getenv("PHISHTANK_APP_KEY") or ""
     ABUSECH_KEY = os.getenv("ABUSECH_AUTH_KEY") or os.getenv("MBZ_AUTH_KEY") or ""
+    OTX_KEY = os.getenv("OTX_API_KEY") or ""
     use_threatfox = bool(ABUSECH_KEY)
     use_urlhaus = True  # URLhaus funciona sin auth key también
+    use_otx = bool(OTX_KEY)
 
     if not ABUSECH_KEY:
         print(
@@ -1761,6 +1853,7 @@ def run_domain_osint_lookup(list_file: str = DOMAIN_LIST_FILE, resume=None):
     out_csv = f"{formatted_time}_DOMAINS_OSINT.csv"
     fields = [
         "domain",
+        "verdict",
         "ctx_openphish_present",
         "ctx_phishtank_status",
         "ctx_urlhaus_present",
@@ -1780,6 +1873,11 @@ def run_domain_osint_lookup(list_file: str = DOMAIN_LIST_FILE, resume=None):
             "threatfox_tags",
             "threatfox_first_seen",
             "threatfox_status",
+        ]
+    if use_otx:
+        fields += [
+            "otx_pulses",
+            "otx_status",
         ]
     fields += [
         "rdap_registrar",
@@ -1808,15 +1906,11 @@ def run_domain_osint_lookup(list_file: str = DOMAIN_LIST_FILE, resume=None):
                 if i < start_i:
                     continue
 
-                op_present = (
-                    "yes" if d in openphish_hosts else "no"
-                )
+                op_present = "yes" if d in openphish_hosts else "no"
                 pt_status = (
                     phishtank_status(d, PHISHTANK_APP_KEY) if PHISHTANK_APP_KEY else ""
                 )
-                uh_present = urlhaus_present_for_domain(
-                    d, ABUSECH_KEY
-                )
+                uh_present = urlhaus_present_for_domain(d, ABUSECH_KEY)
 
                 row = {
                     "domain": d,
@@ -1840,10 +1934,38 @@ def run_domain_osint_lookup(list_file: str = DOMAIN_LIST_FILE, resume=None):
                     row.update(tf)
                     time.sleep(0.2)
 
+                # OTX AlienVault
+                if use_otx:
+                    otx = otx_domain_lookup(d, OTX_KEY)
+                    row.update(otx)
+                    time.sleep(0.2)
+
                 rdap = rdap_lookup(d)
                 row["rdap_registrar"] = rdap.get("registrar", "")
                 row["rdap_created"] = rdap.get("created", "")
                 row["rdap_status"] = rdap.get("status", "")
+
+                # Verdict
+                _mal = (
+                    op_present == "yes"
+                    or uh_present == "yes"
+                    or row.get("threatfox_status") == "ok"
+                    or (pt_status and pt_status not in ("", "not_found"))
+                )
+                _sus = not _mal and (
+                    (
+                        row.get("otx_status") == "ok"
+                        and row.get("otx_pulses", "0").isdigit()
+                        and int(row.get("otx_pulses", "0")) >= 5
+                    )
+                    or (
+                        row.get("urlhaus_url_count", "0").isdigit()
+                        and int(row.get("urlhaus_url_count", "0")) > 0
+                    )
+                )
+                row["verdict"] = (
+                    "malicious" if _mal else "suspicious" if _sus else "clean"
+                )
 
                 w.writerow(row)
 
@@ -1852,6 +1974,10 @@ def run_domain_osint_lookup(list_file: str = DOMAIN_LIST_FILE, resume=None):
                     or (pt_status and pt_status != "not_found")
                     or uh_present == "yes"
                     or row.get("threatfox_status") == "ok"
+                    or (
+                        row.get("otx_status") == "ok"
+                        and row.get("otx_pulses", "0") != "0"
+                    )
                 ):
                     hits += 1
 
@@ -1982,9 +2108,7 @@ def threatfox_search_ioc(ioc: str, auth_key: str) -> dict:
         payload = json.dumps(
             {"query": "search_ioc", "search_term": ioc, "exact_match": True}
         )
-        r = requests.post(
-            THREATFOX_API_URL, headers=headers, data=payload, timeout=25
-        )
+        r = requests.post(THREATFOX_API_URL, headers=headers, data=payload, timeout=25)
         if r.status_code != 200:
             return {**empty, "threatfox_status": f"HTTP{r.status_code}"}
         j = r.json()
@@ -2020,9 +2144,7 @@ def threatfox_search_hash(hash_val: str, auth_key: str) -> dict:
     try:
         headers = {"Auth-Key": auth_key}
         payload = json.dumps({"query": "search_hash", "hash": hash_val})
-        r = requests.post(
-            THREATFOX_API_URL, headers=headers, data=payload, timeout=25
-        )
+        r = requests.post(THREATFOX_API_URL, headers=headers, data=payload, timeout=25)
         if r.status_code != 200:
             return {**empty, "threatfox_status": f"HTTP{r.status_code}"}
         j = r.json()
@@ -2110,6 +2232,122 @@ def urlhaus_payload_lookup(hash_val: str, auth_key: str) -> dict:
         return {**empty, "urlhaus_status": f"ERROR:{e}"}
 
 
+# === OTX AlienVault lookup functions ==========================================
+
+
+def otx_ip_lookup(ip: str, api_key: str) -> dict:
+    empty = {
+        "otx_pulses": "",
+        "otx_reputation": "",
+        "otx_country": "",
+        "otx_asn": "",
+        "otx_status": "",
+    }
+    if not api_key:
+        empty["otx_status"] = "no_key"
+        return empty
+    try:
+        headers = {"X-OTX-API-KEY": api_key, "Accept": "application/json"}
+        r = requests.get(
+            f"{OTX_API_URL}/IPv4/{ip}/general",
+            headers=headers,
+            timeout=20,
+        )
+        if r.status_code == 429:
+            return {**empty, "otx_status": "rate_limited"}
+        if r.status_code == 403:
+            return {**empty, "otx_status": "forbidden"}
+        if r.status_code != 200:
+            return {**empty, "otx_status": f"HTTP{r.status_code}"}
+        j = r.json()
+        pulse_count = j.get("pulse_info", {}).get("count", 0)
+        reputation = j.get("reputation", "")
+        country = j.get("country_name", "") or ""
+        asn = j.get("asn", "") or ""
+        return {
+            "otx_pulses": str(pulse_count),
+            "otx_reputation": str(reputation) if reputation else "",
+            "otx_country": country,
+            "otx_asn": asn,
+            "otx_status": "ok",
+        }
+    except Exception as e:
+        return {**empty, "otx_status": f"ERROR:{e}"}
+
+
+def otx_domain_lookup(domain: str, api_key: str) -> dict:
+    empty = {
+        "otx_pulses": "",
+        "otx_status": "",
+    }
+    if not api_key:
+        empty["otx_status"] = "no_key"
+        return empty
+    try:
+        headers = {"X-OTX-API-KEY": api_key, "Accept": "application/json"}
+        r = requests.get(
+            f"{OTX_API_URL}/domain/{domain}/general",
+            headers=headers,
+            timeout=20,
+        )
+        if r.status_code == 429:
+            return {**empty, "otx_status": "rate_limited"}
+        if r.status_code == 403:
+            return {**empty, "otx_status": "forbidden"}
+        if r.status_code != 200:
+            return {**empty, "otx_status": f"HTTP{r.status_code}"}
+        j = r.json()
+        pulse_count = j.get("pulse_info", {}).get("count", 0)
+        return {
+            "otx_pulses": str(pulse_count),
+            "otx_status": "ok",
+        }
+    except Exception as e:
+        return {**empty, "otx_status": f"ERROR:{e}"}
+
+
+def otx_hash_lookup(hash_val: str, api_key: str) -> dict:
+    empty = {
+        "otx_pulses": "",
+        "otx_malware": "",
+        "otx_status": "",
+    }
+    if not api_key:
+        empty["otx_status"] = "no_key"
+        return empty
+    try:
+        headers = {"X-OTX-API-KEY": api_key, "Accept": "application/json"}
+        r = requests.get(
+            f"{OTX_API_URL}/file/{hash_val}/general",
+            headers=headers,
+            timeout=20,
+        )
+        if r.status_code == 429:
+            return {**empty, "otx_status": "rate_limited"}
+        if r.status_code == 403:
+            return {**empty, "otx_status": "forbidden"}
+        if r.status_code != 200:
+            return {**empty, "otx_status": f"HTTP{r.status_code}"}
+        j = r.json()
+        pulse_count = j.get("pulse_info", {}).get("count", 0)
+        # Intentar extraer familia de malware del análisis
+        analysis = j.get("analysis", {})
+        malware = ""
+        if isinstance(analysis, dict):
+            plugins = analysis.get("plugins", {})
+            if isinstance(plugins, dict):
+                clamav = plugins.get("clamav", {})
+                if isinstance(clamav, dict) and clamav.get("results"):
+                    malware = str(clamav["results"])
+        return {
+            "otx_pulses": str(pulse_count),
+            "otx_malware": malware,
+            "otx_status": "ok",
+        }
+    except Exception as e:
+        return {**empty, "otx_status": f"ERROR:{e}"}
+
+
 def run_hash_osint_lookup(list_file=None, resume=None):
     path = resolve_hash_list_file(list_file)
     if not os.path.exists(path):
@@ -2124,8 +2362,10 @@ def run_hash_osint_lookup(list_file=None, resume=None):
 
     MBZ_AUTH_KEY = os.getenv("MBZ_AUTH_KEY") or ""
     ABUSECH_KEY = os.getenv("ABUSECH_AUTH_KEY") or MBZ_AUTH_KEY
+    OTX_KEY = os.getenv("OTX_API_KEY") or ""
     use_threatfox = bool(ABUSECH_KEY)
     use_urlhaus = True
+    use_otx = bool(OTX_KEY)
 
     if not ABUSECH_KEY:
         print(
@@ -2137,6 +2377,7 @@ def run_hash_osint_lookup(list_file=None, resume=None):
     out_csv = f"{formatted_time}_FILES_HASH_OSINT.csv"
     fields = [
         "hash",
+        "verdict",
         "mbz_family",
         "mbz_first_seen",
         "mbz_tags",
@@ -2160,6 +2401,12 @@ def run_hash_osint_lookup(list_file=None, resume=None):
             "urlhaus_url_count",
             "urlhaus_status",
         ]
+    if use_otx:
+        fields += [
+            "otx_pulses",
+            "otx_malware",
+            "otx_status",
+        ]
     start_i = (
         int(resume.get("idx", 0))
         if (resume and resume.get("mode") == "hash_osint")
@@ -2171,6 +2418,7 @@ def run_hash_osint_lookup(list_file=None, resume=None):
     hits_mbz = 0
     hits_tf = 0
     hits_uh = 0
+    hits_otx = 0
     with open(out_csv, mode, newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=fields)
         if start_i == 0:
@@ -2216,8 +2464,29 @@ def run_hash_osint_lookup(list_file=None, resume=None):
                         hits_uh += 1
                     time.sleep(0.2)
 
-                if mbz_hit or tf_hit or uh_hit:
+                # OTX AlienVault hash lookup
+                otx_hit = False
+                if use_otx:
+                    otx = otx_hash_lookup(h, OTX_KEY)
+                    row.update(otx)
+                    if (
+                        otx.get("otx_status") == "ok"
+                        and otx.get("otx_pulses", "0") != "0"
+                    ):
+                        otx_hit = True
+                        hits_otx += 1
+                    time.sleep(0.2)
+
+                if mbz_hit or tf_hit or uh_hit or otx_hit:
                     hits += 1
+
+                # Verdict
+                _mal = mbz_hit or tf_hit or uh_hit
+                _sus = not _mal and otx_hit
+                row["verdict"] = (
+                    "malicious" if _mal else "suspicious" if _sus else "clean"
+                )
+
                 w.writerow(row)
                 save_ckpt(
                     {"mode": "hash_osint", "idx": i + 1, "timestamp": time.time()}
@@ -2236,6 +2505,8 @@ def run_hash_osint_lookup(list_file=None, resume=None):
             print(f"[i]  - ThreatFox    : {hits_tf}")
         if use_urlhaus:
             print(f"[i]  - URLhaus      : {hits_uh}")
+        if use_otx:
+            print(f"[i]  - OTX          : {hits_otx}")
     else:
         print(f"\nHecho. Salida: {out_csv}")
         print(
@@ -2246,6 +2517,8 @@ def run_hash_osint_lookup(list_file=None, resume=None):
             print(f"[i]  - ThreatFox    : {hits_tf}")
         if use_urlhaus:
             print(f"[i]  - URLhaus      : {hits_uh}")
+        if use_otx:
+            print(f"[i]  - OTX          : {hits_otx}")
     print("\n" + frase_epica_random() + "\n")
 
 
@@ -4063,6 +4336,8 @@ def main():
     if all_keys["ABUSECH"]:
         os.environ.setdefault("ABUSECH_AUTH_KEY", all_keys["ABUSECH"])
         os.environ.setdefault("MBZ_AUTH_KEY", all_keys["ABUSECH"])
+    if all_keys["OTX"]:
+        os.environ.setdefault("OTX_API_KEY", all_keys["OTX"])
 
     # Resumen de keys cargadas
     loaded = ["VT"] if api_keys else []
@@ -4070,6 +4345,8 @@ def main():
         loaded.append("AbuseIPDB")
     if all_keys["ABUSECH"]:
         loaded.append("abuse.ch (ThreatFox/URLhaus/MBZ)")
+    if all_keys["OTX"]:
+        loaded.append("OTX AlienVault")
     if loaded:
         print(
             f"[API] Keys loaded: {', '.join(loaded)}"
