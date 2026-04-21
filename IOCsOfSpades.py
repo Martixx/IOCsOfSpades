@@ -80,15 +80,6 @@ FAST_DOMAINS_MAX = int(os.getenv("FAST_DOMAINS_MAX", "0") or 0)  # 0 = sin lími
 FAST_FILES_MAX = int(os.getenv("FAST_FILES_MAX", "0") or 0)
 
 
-def resolve_ip_list_file(path: str = None):
-    if path and os.path.exists(path):
-        return path
-    for cand in (IP_LIST_FILE, "iplist.txt", "list_ips.txt", "ips.txt"):
-        if os.path.exists(cand):
-            return cand
-    return path or IP_LIST_FILE
-
-
 # -------- Parámetros
 IP_RES_LIMIT = 40
 FAST_PROFILE = False
@@ -132,17 +123,6 @@ TOR_TIMEOUT = 18
 PREFER_VT_FOR_VPN = True  # VT-first estricto
 
 # -------- Campos CSV (IPs)
-CANON_IP_FIELDS = [
-    "canon_indicator_type",
-    "canon_verdict",
-    "canon_threat_type_primary",
-    "canon_threat_type_tags",
-    "canon_confidence",
-    "canon_is_vpn_confirmed",
-    "canon_vpn_hint_owner",
-    "canon_decision_trace",
-]
-
 ALL_FIELDS = [
     "owner",
     "asn",
@@ -176,7 +156,7 @@ ALL_FIELDS = [
     "tor_source",
     "tor_nickname",
     "tor_fingerprint",
-] + CANON_IP_FIELDS
+]
 
 VPN_KEYWORDS = [
     "vpn",
@@ -847,117 +827,6 @@ def parse_key_pool(raw_value: str) -> list:
     return out
 
 
-def _canon_int(value):
-    try:
-        return int(float(str(value or "0").strip()))
-    except Exception:
-        return 0
-
-
-def _build_canonical_ip_fields(row):
-    malicious = _canon_int(row.get("malicious"))
-    suspicious = _canon_int(row.get("suspicious"))
-    harmless = _canon_int(row.get("harmless"))
-    risk = _canon_int(row.get("risk_score"))
-    vendors = [v for v in str(row.get("vendors_malicious", "")).split(",") if v.strip()]
-    vm_count = len(vendors)
-    c2_yes = str(row.get("c2_suspect", "")).strip().lower() == "yes"
-    vpn_yes = str(row.get("is_vpn", "")).strip().lower() == "yes"
-    tor_yes = str(row.get("tor_exit", "")).strip().lower() == "yes"
-
-    text_hints = " ".join(
-        [
-            str(row.get("vt_categories", "") or ""),
-            str(row.get("vt_labels", "") or ""),
-            str(row.get("vt_crowdsourced_tags", "") or ""),
-            str(row.get("vt_ip_tags", "") or ""),
-            str(row.get("c2_reason", "") or ""),
-            str(row.get("cluster_reason", "") or ""),
-        ]
-    ).lower()
-
-    tags = []
-    if "phish" in text_hints or "credential" in text_hints:
-        tags.append("phishing")
-    if any(k in text_hints for k in ["malware", "trojan", "stealer", "ransom", "virus", "worm"]):
-        tags.append("malware")
-    if c2_yes or any(k in text_hints for k in ["c2", "command and control", "beacon"]):
-        tags.append("c2")
-    if any(k in text_hints for k in ["botnet", "ddos"]):
-        tags.append("botnet")
-    if any(k in text_hints for k in ["scan", "scanner", "bruteforce", "exploit"]):
-        tags.append("scanner")
-    if any(k in text_hints for k in ["adware", "malvert", "advert", "ads"]):
-        tags.append("adware")
-    if vpn_yes or tor_yes or any(k in text_hints for k in ["proxy", "vpn", "tor"]):
-        tags.append("proxy")
-    if "spam" in text_hints:
-        tags.append("spam")
-
-    if malicious > 0 and "malware" not in tags:
-        tags.append("malware")
-
-    priority = ["phishing", "malware", "c2", "botnet", "scanner", "adware", "proxy", "spam"]
-    ordered_tags = [t for t in priority if t in tags]
-    for t in tags:
-        if t not in ordered_tags:
-            ordered_tags.append(t)
-    primary = ordered_tags[0] if ordered_tags else ""
-
-    if malicious > 0 or c2_yes or risk >= 70:
-        verdict = "malicious"
-    elif suspicious > 0 or risk >= 40:
-        verdict = "suspicious"
-    elif harmless > 0 and malicious == 0 and suspicious == 0:
-        verdict = "clean"
-    else:
-        verdict = "unknown"
-
-    confidence = 0
-    confidence += min(malicious, 10) * 4
-    confidence += min(vm_count, 8) * 4
-    if c2_yes:
-        confidence += 15
-    if risk >= 70:
-        confidence += 20
-    elif risk >= 40:
-        confidence += 10
-    if verdict == "clean":
-        confidence += 15
-    if vpn_yes:
-        confidence += 5
-    confidence = max(0, min(100, confidence))
-
-    trace = []
-    if malicious > 0:
-        trace.append(f"vt.malicious={malicious}")
-    if suspicious > 0:
-        trace.append(f"vt.suspicious={suspicious}")
-    if vm_count > 0:
-        trace.append(f"vt.vendors_malicious={vm_count}")
-    if risk > 0:
-        trace.append(f"risk_score={risk}")
-    if c2_yes:
-        trace.append("c2_suspect=yes")
-    if vpn_yes:
-        trace.append("is_vpn=yes")
-    if str(row.get("vpn_suspect", "")).strip().lower() == "yes":
-        trace.append("vpn_suspect=yes")
-    if tor_yes:
-        trace.append("tor_exit=yes")
-
-    return {
-        "canon_indicator_type": "ip",
-        "canon_verdict": verdict,
-        "canon_threat_type_primary": primary,
-        "canon_threat_type_tags": ",".join(ordered_tags),
-        "canon_confidence": str(confidence),
-        "canon_is_vpn_confirmed": "yes" if vpn_yes else "no",
-        "canon_vpn_hint_owner": str(row.get("vpn_suspect", "") or "no"),
-        "canon_decision_trace": "; ".join(trace),
-    }
-
-
 def rotating_lookup(key_pool, idx_ptr, fn_lookup, status_field, rotate_statuses):
     """
     Ejecuta fn_lookup(key) rotando por el pool cuando status_field devuelve
@@ -1553,11 +1422,8 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
         else "\n=== ANALIZAR IPs en OTRAS FUENTES (OSINT) ==="
     )
 
-    # Auto-detectar ruta del fichero de IPs
-    use_path = resolve_ip_list_file(list_path)
-
     # 1) Carga y filtrado de IPs (públicas IPv4)
-    raw = read_lines(use_path) if os.path.exists(use_path) else []
+    raw = read_lines(list_path) if os.path.exists(list_path) else []
     ip_list, skipped = filter_valid_public_ips(raw, allow_private=False)
 
     if skipped:
@@ -3367,9 +3233,7 @@ def run_ip_analysis_normal(selected_fields, api_keys, resume=None):
         print("\n━━━━━━━━  PAUSA / REANUDAR  ━━━━━━━━")
         print("Ctrl+C → guarda checkpoint y termina. Reanuda desde IP > 8).")
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
-    # Auto-detectar ruta del fichero de IPs
-    use_path = resolve_ip_list_file()
-    raw_lines = read_lines(use_path)
+    raw_lines = read_lines(IP_LIST_FILE)
     ip_list, skipped = filter_valid_public_ips(raw_lines, allow_private=False)
     if skipped:
         motivos = {}
@@ -3447,9 +3311,6 @@ def run_ip_analysis_normal(selected_fields, api_keys, resume=None):
                         row["owner"] = f"HTTP{r.status_code}"
                 else:
                     row["owner"] = "NO_API_KEY"
-                # Añadir campos canónicos
-                canon_fields = _build_canonical_ip_fields(row)
-                row.update(canon_fields)
                 w.writerow({k: row.get(k, "") for k in fields})
                 save_ckpt(
                     {
@@ -3490,9 +3351,7 @@ def run_ip_analysis_tor(selected_fields, api_keys, resume=None):
             "Pulsa Ctrl+C → guarda checkpoint y termina de forma segura. Reanuda con 9) en el menú."
         )
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
-    # Auto-detectar ruta del fichero de IPs
-    use_path = resolve_ip_list_file()
-    raw_lines = read_lines(use_path)
+    raw_lines = read_lines(IP_LIST_FILE)
     ip_list, skipped = filter_valid_public_ips(raw_lines, allow_private=False)
     if skipped:
         motivos = {}
@@ -3578,9 +3437,6 @@ def run_ip_analysis_tor(selected_fields, api_keys, resume=None):
                 row["tor_source"] = tor_src
                 row["tor_nickname"] = tor_nick
                 row["tor_fingerprint"] = tor_fpr
-                # Añadir campos canónicos
-                canon_fields = _build_canonical_ip_fields(row)
-                row.update(canon_fields)
                 w.writerow({k: row.get(k, "") for k in fields})
                 save_ckpt(
                     {
