@@ -78,6 +78,23 @@ OUTPUT_FILES_CSV = f"{formatted_time}_DOMAINS_FILES.csv"
 
 FAST_DOMAINS_MAX = int(os.getenv("FAST_DOMAINS_MAX", "0") or 0)  # 0 = sin límite
 FAST_FILES_MAX = int(os.getenv("FAST_FILES_MAX", "0") or 0)
+MAX_DOMAINS_PER_IP_DEFAULT = int(os.getenv("MAX_DOMAINS_PER_IP", "200") or 200)
+MAX_FILES_PER_DOMAIN_DEFAULT = int(
+    os.getenv("MAX_FILES_PER_DOMAIN", "200") or 200
+)
+VT_DOMAINS_RPM_DEFAULT = int(os.getenv("VT_DOMAINS_RPM", "4") or 4)
+VT_FILES_RPM_DEFAULT = int(os.getenv("VT_FILES_RPM", "4") or 4)
+API_RETRY_ATTEMPTS = int(os.getenv("API_RETRY_ATTEMPTS", "2") or 2)
+API_RETRY_BACKOFF_S = float(os.getenv("API_RETRY_BACKOFF_S", "1.0") or 1.0)
+
+
+def resolve_ip_list_file(path: str = None):
+    if path and os.path.exists(path):
+        return path
+    for cand in (IP_LIST_FILE, "iplist.txt", "list_ips.txt", "ips.txt"):
+        if os.path.exists(cand):
+            return cand
+    return path or IP_LIST_FILE
 
 
 # -------- Parámetros
@@ -123,6 +140,16 @@ TOR_TIMEOUT = 18
 PREFER_VT_FOR_VPN = True  # VT-first estricto
 
 # -------- Campos CSV (IPs)
+CANON_IP_FIELDS = [
+    "canon_indicator_type",
+    "canon_threat_type_primary",
+    "canon_threat_type_tags",
+    "canon_confidence",
+    "canon_is_vpn_confirmed",
+    "canon_vpn_hint_owner",
+    "canon_decision_trace",
+]
+
 ALL_FIELDS = [
     "owner",
     "asn",
@@ -138,9 +165,6 @@ ALL_FIELDS = [
     "vt_ip_tags",
     "vt_vpn",
     "vpn_suspect",
-    "vt_categories",
-    "vt_labels",
-    "vt_crowdsourced_tags",
     "whois",
     "is_vpn",
     "vpn_source",
@@ -150,13 +174,12 @@ ALL_FIELDS = [
     "c2_suspect",
     "c2_reason",
     "risk_score",
-    "link",
     "gui",
     "tor_exit",
     "tor_source",
     "tor_nickname",
     "tor_fingerprint",
-]
+] + CANON_IP_FIELDS
 
 VPN_KEYWORDS = [
     "vpn",
@@ -827,6 +850,296 @@ def parse_key_pool(raw_value: str) -> list:
     return out
 
 
+def _canon_int(value):
+    try:
+        return int(float(str(value or "0").strip()))
+    except Exception:
+        return 0
+
+
+def _build_canonical_ip_fields(row):
+    malicious = _canon_int(row.get("malicious"))
+    suspicious = _canon_int(row.get("suspicious"))
+    harmless = _canon_int(row.get("harmless"))
+    risk = _canon_int(row.get("risk_score"))
+    vendors = [v for v in str(row.get("vendors_malicious", "")).split(",") if v.strip()]
+    vm_count = len(vendors)
+    c2_yes = str(row.get("c2_suspect", "")).strip().lower() == "yes"
+    vpn_yes = str(row.get("is_vpn", "")).strip().lower() == "yes"
+    tor_yes = str(row.get("tor_exit", "")).strip().lower() == "yes"
+
+    text_hints = " ".join(
+        [
+            str(row.get("vt_categories", "") or ""),
+            str(row.get("vt_labels", "") or ""),
+            str(row.get("vt_crowdsourced_tags", "") or ""),
+            str(row.get("vt_ip_tags", "") or ""),
+            str(row.get("c2_reason", "") or ""),
+            str(row.get("cluster_reason", "") or ""),
+        ]
+    ).lower()
+
+    tags = []
+    if "phish" in text_hints or "credential" in text_hints:
+        tags.append("phishing")
+    if any(k in text_hints for k in ["malware", "trojan", "stealer", "ransom", "virus", "worm"]):
+        tags.append("malware")
+    if c2_yes or any(k in text_hints for k in ["c2", "command and control", "beacon"]):
+        tags.append("c2")
+    if any(k in text_hints for k in ["botnet", "ddos"]):
+        tags.append("botnet")
+    if any(k in text_hints for k in ["scan", "scanner", "bruteforce", "exploit"]):
+        tags.append("scanner")
+    if any(k in text_hints for k in ["adware", "malvert", "advert", "ads"]):
+        tags.append("adware")
+    if vpn_yes or tor_yes or any(k in text_hints for k in ["proxy", "vpn", "tor"]):
+        tags.append("proxy")
+    if "spam" in text_hints:
+        tags.append("spam")
+
+    if malicious > 0 and "malware" not in tags:
+        tags.append("malware")
+
+    priority = ["phishing", "malware", "c2", "botnet", "scanner", "adware", "proxy", "spam"]
+    ordered_tags = [t for t in priority if t in tags]
+    for t in tags:
+        if t not in ordered_tags:
+            ordered_tags.append(t)
+    primary = ordered_tags[0] if ordered_tags else "unknown"
+
+    if malicious > 0 or c2_yes or risk >= 70:
+        verdict = "malicious"
+    elif suspicious > 0 or risk >= 40:
+        verdict = "suspicious"
+    elif harmless > 0 and malicious == 0 and suspicious == 0:
+        verdict = "clean"
+    else:
+        verdict = "unknown"
+
+    confidence = 0
+    confidence += min(malicious, 10) * 4
+    confidence += min(vm_count, 8) * 4
+    if c2_yes:
+        confidence += 15
+    if risk >= 70:
+        confidence += 20
+    elif risk >= 40:
+        confidence += 10
+    if verdict == "clean":
+        confidence += 15
+    if vpn_yes:
+        confidence += 5
+    confidence = max(0, min(100, confidence))
+
+    trace = []
+    if malicious > 0:
+        trace.append(f"vt.malicious={malicious}")
+    if suspicious > 0:
+        trace.append(f"vt.suspicious={suspicious}")
+    if vm_count > 0:
+        trace.append(f"vt.vendors_malicious={vm_count}")
+    if risk > 0:
+        trace.append(f"risk_score={risk}")
+    if c2_yes:
+        trace.append("c2_suspect=yes")
+    if vpn_yes:
+        trace.append("is_vpn=yes")
+    if str(row.get("vpn_suspect", "")).strip().lower() == "yes":
+        trace.append("vpn_suspect=yes")
+    if tor_yes:
+        trace.append("tor_exit=yes")
+
+    return {
+        "canon_indicator_type": "ip",
+        "canon_threat_type_primary": primary,
+        "canon_threat_type_tags": ",".join(ordered_tags or [primary]),
+        "canon_confidence": str(confidence),
+        "canon_is_vpn_confirmed": "yes" if vpn_yes else "no",
+        "canon_vpn_hint_owner": str(row.get("vpn_suspect", "") or "no"),
+        "canon_decision_trace": "; ".join(trace),
+    }
+
+
+def _build_canonical_domain_fields(row):
+    """Campos canónicos para filas de *_DOMAINS.csv (misma estructura que IP para compatibilidad con Master)."""
+    malicious = _canon_int(row.get("vt_malicious"))
+    suspicious = _canon_int(row.get("vt_suspicious"))
+    harmless = _canon_int(row.get("vt_harmless"))
+    reputation = _canon_int(row.get("vt_reputation"))
+
+    text_hints = " ".join(
+        [
+            str(row.get("vt_categories", "") or ""),
+            str(row.get("vt_domain_tags", "") or ""),
+            str(row.get("vt_verdict", "") or ""),
+        ]
+    ).lower()
+
+    tags = []
+    if "phish" in text_hints or "credential" in text_hints:
+        tags.append("phishing")
+    if any(k in text_hints for k in ["malware", "trojan", "stealer", "ransom", "virus", "worm"]):
+        tags.append("malware")
+    if any(k in text_hints for k in ["c2", "command and control", "beacon"]):
+        tags.append("c2")
+    if any(k in text_hints for k in ["botnet", "ddos"]):
+        tags.append("botnet")
+    if any(k in text_hints for k in ["scan", "scanner", "bruteforce", "exploit"]):
+        tags.append("scanner")
+    if any(k in text_hints for k in ["adware", "malvert", "advert"]):
+        tags.append("adware")
+    if any(k in text_hints for k in ["proxy", "vpn", "tor"]):
+        tags.append("proxy")
+    if "spam" in text_hints:
+        tags.append("spam")
+    if malicious > 0 and not tags:
+        tags.append("malware")
+
+    priority = ["phishing", "malware", "c2", "botnet", "scanner", "adware", "proxy", "spam"]
+    ordered_tags = [t for t in priority if t in tags]
+    for t in tags:
+        if t not in ordered_tags:
+            ordered_tags.append(t)
+    primary = ordered_tags[0] if ordered_tags else "unknown"
+
+    vt_verdict_raw = str(row.get("vt_verdict", "") or "").strip().lower()
+    if malicious > 0 or vt_verdict_raw == "malicious":
+        verdict = "malicious"
+    elif suspicious > 0 or vt_verdict_raw == "suspicious":
+        verdict = "suspicious"
+    elif harmless > 0 and malicious == 0 and suspicious == 0:
+        verdict = "clean"
+    else:
+        verdict = "unknown"
+
+    confidence = 0
+    confidence += min(malicious, 10) * 5
+    confidence += min(suspicious, 5) * 2
+    if reputation < -10:
+        confidence += 15
+    elif reputation < 0:
+        confidence += 5
+    if verdict == "clean":
+        confidence += 15
+    confidence = max(0, min(100, confidence))
+
+    trace = []
+    if malicious > 0:
+        trace.append(f"vt.malicious={malicious}")
+    if suspicious > 0:
+        trace.append(f"vt.suspicious={suspicious}")
+    if reputation != 0:
+        trace.append(f"vt.reputation={reputation}")
+    if vt_verdict_raw:
+        trace.append(f"vt.verdict={vt_verdict_raw}")
+
+    return {
+        "canon_indicator_type": "domain",
+        "canon_threat_type_primary": primary,
+        "canon_threat_type_tags": ",".join(ordered_tags or [primary]),
+        "canon_confidence": str(confidence),
+        "canon_is_vpn_confirmed": "no",
+        "canon_vpn_hint_owner": "",
+        "canon_decision_trace": "; ".join(trace),
+    }
+
+
+def _is_retryable_error_text(err_text: str) -> bool:
+    s = str(err_text or "").lower()
+    needles = [
+        "timed out",
+        "timeout",
+        "connectionpool",
+        "connection reset",
+        "temporar",
+        "remote end closed",
+    ]
+    return any(n in s for n in needles)
+
+
+def _request_with_retry(
+    method: str,
+    url: str,
+    headers=None,
+    params=None,
+    data=None,
+    timeout=20,
+    retries=API_RETRY_ATTEMPTS,
+):
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.request(
+                method=method,
+                url=url,
+                headers=headers,
+                params=params,
+                data=data,
+                timeout=timeout,
+            )
+            if resp.status_code in (502, 503, 504) and attempt < retries:
+                time.sleep(API_RETRY_BACKOFF_S * (attempt + 1))
+                continue
+            return resp
+        except Exception as e:
+            last_exc = e
+            if attempt < retries and _is_retryable_error_text(str(e)):
+                time.sleep(API_RETRY_BACKOFF_S * (attempt + 1))
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("request failed")
+
+
+def ask_positive_limit(label: str, default_value: int) -> int:
+    try:
+        if LANG == "en":
+            raw = input(
+                f"{label} [default {default_value}, 0=unlimited]: "
+            ).strip()
+        else:
+            raw = input(
+                f"{label} [por defecto {default_value}, 0=sin límite]: "
+            ).strip()
+    except (KeyboardInterrupt, EOFError):
+        return None
+    if raw == "":
+        return default_value
+    try:
+        val = int(raw)
+        return max(0, val)
+    except Exception:
+        return default_value
+
+
+def ask_rpm_limit(label: str, default_value: int) -> int:
+    try:
+        if LANG == "en":
+            raw = input(
+                f"{label} [default {default_value}, higher=faster]: "
+            ).strip()
+        else:
+            raw = input(
+                f"{label} [por defecto {default_value}, más alto=más rápido]: "
+            ).strip()
+    except (KeyboardInterrupt, EOFError):
+        return None
+    if raw == "":
+        return max(1, default_value)
+    try:
+        val = int(raw)
+        return max(1, val)
+    except Exception:
+        return max(1, default_value)
+
+
+def _make_unlocked_output_name(path: str) -> str:
+    base, ext = os.path.splitext(path)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{base}_{stamp}{ext}"
+
+
 def rotating_lookup(key_pool, idx_ptr, fn_lookup, status_field, rotate_statuses):
     """
     Ejecuta fn_lookup(key) rotando por el pool cuando status_field devuelve
@@ -848,29 +1161,100 @@ def rotating_lookup(key_pool, idx_ptr, fn_lookup, status_field, rotate_statuses)
     return res, idx_ptr, True
 
 
-def save_ckpt(data: dict):
-    try:
-        with open(CKPT_FILE, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2)
-    except Exception:
-        pass
+def _ckpt_file_for_mode(mode: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9_\-]", "_", str(mode or "generic").strip())
+    return f".iocs_checkpoint_{safe}.json"
 
 
-def load_ckpt():
+def _read_ckpt_file(path: str):
     try:
-        if not os.path.exists(CKPT_FILE):
+        if not os.path.exists(path):
             return None
-        with open(CKPT_FILE, "r", encoding="utf-8") as fh:
+        with open(path, "r", encoding="utf-8") as fh:
             return json.load(fh)
     except Exception:
         return None
 
 
-def clear_ckpt():
+def _collect_ckpts():
+    entries = []
+    # Formato nuevo: un fichero por modo
+    for p in glob.glob(".iocs_checkpoint_*.json"):
+        ck = _read_ckpt_file(p)
+        if isinstance(ck, dict):
+            entries.append(ck)
+
+    # Compatibilidad con formato antiguo (único fichero)
+    legacy = _read_ckpt_file(CKPT_FILE)
+    if isinstance(legacy, dict):
+        entries.append(legacy)
+
+    return entries
+
+
+def load_latest_ckpt(modes=None):
+    cks = _collect_ckpts()
+    if modes:
+        wanted = set(modes)
+        cks = [c for c in cks if c.get("mode") in wanted]
+    if not cks:
+        return None
+    return max(cks, key=lambda c: float(c.get("timestamp", 0) or 0))
+
+
+def save_ckpt(data: dict):
     try:
-        if os.path.exists(CKPT_FILE):
-            os.remove(CKPT_FILE)
+        mode = str((data or {}).get("mode") or "generic")
+        path = _ckpt_file_for_mode(mode)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+    except Exception:
+        pass
+
+
+def load_ckpt(mode=None):
+    if mode:
+        ck = _read_ckpt_file(_ckpt_file_for_mode(mode))
+        if isinstance(ck, dict):
+            return ck
+
+        # fallback compat: si legacy existe y coincide modo
+        legacy = _read_ckpt_file(CKPT_FILE)
+        if isinstance(legacy, dict) and legacy.get("mode") == mode:
+            return legacy
+        return None
+
+    return load_latest_ckpt()
+
+
+def clear_ckpt(mode=None):
+    try:
+        removed = 0
+        if mode:
+            p = _ckpt_file_for_mode(mode)
+            if os.path.exists(p):
+                os.remove(p)
+                removed += 1
+            # limpiar legacy solo si coincide modo
+            legacy = _read_ckpt_file(CKPT_FILE)
+            if isinstance(legacy, dict) and legacy.get("mode") == mode:
+                os.remove(CKPT_FILE)
+                removed += 1
+        else:
+            for p in glob.glob(".iocs_checkpoint_*.json"):
+                try:
+                    os.remove(p)
+                    removed += 1
+                except Exception:
+                    pass
+            if os.path.exists(CKPT_FILE):
+                os.remove(CKPT_FILE)
+                removed += 1
+
+        if removed > 0:
             print("[CKPT] Cleared." if LANG == "en" else "[CKPT] Borrado.")
+        else:
+            print("[CKPT] Nothing to clear." if LANG == "en" else "[CKPT] Nada que borrar.")
     except Exception:
         pass
 
@@ -1422,8 +1806,11 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
         else "\n=== ANALIZAR IPs en OTRAS FUENTES (OSINT) ==="
     )
 
+    # Auto-detectar ruta del fichero de IPs
+    use_path = resolve_ip_list_file(list_path)
+
     # 1) Carga y filtrado de IPs (públicas IPv4)
-    raw = read_lines(list_path) if os.path.exists(list_path) else []
+    raw = read_lines(use_path) if os.path.exists(use_path) else []
     ip_list, skipped = filter_valid_public_ips(raw, allow_private=False)
 
     if skipped:
@@ -2410,25 +2797,37 @@ def threatfox_search_ioc(ioc: str, auth_key: str) -> dict:
         return empty
     try:
         headers = {"Auth-Key": auth_key}
-        payload = json.dumps(
-            {"query": "search_ioc", "search_term": ioc, "exact_match": True}
-        )
-        r = requests.post(THREATFOX_API_URL, headers=headers, data=payload, timeout=25)
-        if r.status_code != 200:
-            return {**empty, "threatfox_status": f"HTTP{r.status_code}"}
-        j = r.json()
-        qstatus = (j.get("query_status") or "").lower()
-        if qstatus == "no_result" or not j.get("data"):
-            return {**empty, "threatfox_status": "not_found"}
-        hit = j["data"][0]
-        return {
-            "threatfox_malware": hit.get("malware_printable", "") or "",
-            "threatfox_threat_type": hit.get("threat_type", "") or "",
-            "threatfox_confidence": str(hit.get("confidence_level", "")),
-            "threatfox_tags": ",".join(hit.get("tags") or []),
-            "threatfox_first_seen": hit.get("first_seen", "") or "",
-            "threatfox_status": "ok",
-        }
+        for exact_flag in (True, False):
+            payload = json.dumps(
+                {
+                    "query": "search_ioc",
+                    "search_term": ioc,
+                    "exact_match": exact_flag,
+                }
+            )
+            r = _request_with_retry(
+                "POST",
+                THREATFOX_API_URL,
+                headers=headers,
+                data=payload,
+                timeout=25,
+            )
+            if r.status_code != 200:
+                return {**empty, "threatfox_status": f"HTTP{r.status_code}"}
+            j = r.json()
+            qstatus = (j.get("query_status") or "").lower()
+            if qstatus == "no_result" or not j.get("data"):
+                continue
+            hit = j["data"][0]
+            return {
+                "threatfox_malware": hit.get("malware_printable", "") or "",
+                "threatfox_threat_type": hit.get("threat_type", "") or "",
+                "threatfox_confidence": str(hit.get("confidence_level", "")),
+                "threatfox_tags": ",".join(hit.get("tags") or []),
+                "threatfox_first_seen": hit.get("first_seen", "") or "",
+                "threatfox_status": "ok",
+            }
+        return {**empty, "threatfox_status": "not_found"}
     except Exception as e:
         return {**empty, "threatfox_status": f"ERROR:{e}"}
 
@@ -2449,7 +2848,9 @@ def threatfox_search_hash(hash_val: str, auth_key: str) -> dict:
     try:
         headers = {"Auth-Key": auth_key}
         payload = json.dumps({"query": "search_hash", "hash": hash_val})
-        r = requests.post(THREATFOX_API_URL, headers=headers, data=payload, timeout=25)
+        r = _request_with_retry(
+            "POST", THREATFOX_API_URL, headers=headers, data=payload, timeout=25
+        )
         if r.status_code != 200:
             return {**empty, "threatfox_status": f"HTTP{r.status_code}"}
         j = r.json()
@@ -2481,14 +2882,16 @@ def urlhaus_host_lookup(host: str, auth_key: str) -> dict:
     try:
         headers = {"Auth-Key": auth_key} if auth_key else {}
         data = {"host": host}
-        r = requests.post(
-            URLHAUS_API_URL + "host/", headers=headers, data=data, timeout=25
+        r = _request_with_retry(
+            "POST", URLHAUS_API_URL + "host/", headers=headers, data=data, timeout=25
         )
         if r.status_code != 200:
             return {**empty, "urlhaus_status": f"HTTP{r.status_code}"}
         j = r.json()
         qstatus = (j.get("query_status") or j.get("query_staus") or "").lower()
         if qstatus in ("no_results", "invalid_host"):
+            return {**empty, "urlhaus_status": "not_found"}
+        if str(j.get("url_count", "") or "") in ("", "0"):
             return {**empty, "urlhaus_status": "not_found"}
         bls = j.get("blacklists") or {}
         return {
@@ -2517,8 +2920,12 @@ def urlhaus_payload_lookup(hash_val: str, auth_key: str) -> dict:
             data = {"md5_hash": hash_val}
         else:
             data = {"sha256_hash": hash_val}
-        r = requests.post(
-            URLHAUS_API_URL + "payload/", headers=headers, data=data, timeout=25
+        r = _request_with_retry(
+            "POST",
+            URLHAUS_API_URL + "payload/",
+            headers=headers,
+            data=data,
+            timeout=25,
         )
         if r.status_code != 200:
             return {**empty, "urlhaus_status": f"HTTP{r.status_code}"}
@@ -2553,10 +2960,8 @@ def otx_ip_lookup(ip: str, api_key: str) -> dict:
         return empty
     try:
         headers = {"X-OTX-API-KEY": api_key, "Accept": "application/json"}
-        r = requests.get(
-            f"{OTX_API_URL}/IPv4/{ip}/general",
-            headers=headers,
-            timeout=20,
+        r = _request_with_retry(
+            "GET", f"{OTX_API_URL}/IPv4/{ip}/general", headers=headers, timeout=20
         )
         if r.status_code == 429:
             return {**empty, "otx_status": "rate_limited"}
@@ -2590,7 +2995,8 @@ def otx_domain_lookup(domain: str, api_key: str) -> dict:
         return empty
     try:
         headers = {"X-OTX-API-KEY": api_key, "Accept": "application/json"}
-        r = requests.get(
+        r = _request_with_retry(
+            "GET",
             f"{OTX_API_URL}/domain/{domain}/general",
             headers=headers,
             timeout=20,
@@ -2622,10 +3028,8 @@ def otx_hash_lookup(hash_val: str, api_key: str) -> dict:
         return empty
     try:
         headers = {"X-OTX-API-KEY": api_key, "Accept": "application/json"}
-        r = requests.get(
-            f"{OTX_API_URL}/file/{hash_val}/general",
-            headers=headers,
-            timeout=20,
+        r = _request_with_retry(
+            "GET", f"{OTX_API_URL}/file/{hash_val}/general", headers=headers, timeout=20
         )
         if r.status_code == 429:
             return {**empty, "otx_status": "rate_limited"}
@@ -3060,6 +3464,15 @@ def flatten(o):
     return [str(o)]
 
 
+def normalize_whois_single_cell(value: str) -> str:
+    txt = str(value or "").replace("\r", "\n").strip()
+    if not txt:
+        return ""
+    # Mantener contenido de WHOIS en una sola celda CSV, sin saltos de línea.
+    parts = [p.strip() for p in txt.split("\n") if p.strip()]
+    return " | ".join(parts)
+
+
 def extract_fields_ip(data):
     out = {
         "ip": "",
@@ -3132,7 +3545,7 @@ def extract_fields_ip(data):
                 sorted(set(flatten(attrs["crowdsourced_tags"])))
             )
 
-        w = (attrs.get("whois") or "").replace("\r", "\n").strip()
+        w = normalize_whois_single_cell(attrs.get("whois") or "")
         if w:
             out["whois"] = w
 
@@ -3233,7 +3646,16 @@ def run_ip_analysis_normal(selected_fields, api_keys, resume=None):
         print("\n━━━━━━━━  PAUSA / REANUDAR  ━━━━━━━━")
         print("Ctrl+C → guarda checkpoint y termina. Reanuda desde IP > 8).")
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
-    raw_lines = read_lines(IP_LIST_FILE)
+    vt_ips_rpm = ask_rpm_limit(
+        "VT requests per minute (IPs)" if LANG == "en" else "Peticiones VT por minuto (IPs)",
+        4,
+    )
+    if vt_ips_rpm is None:
+        return
+    rate = [None]
+    # Auto-detectar ruta del fichero de IPs
+    use_path = resolve_ip_list_file()
+    raw_lines = read_lines(use_path)
     ip_list, skipped = filter_valid_public_ips(raw_lines, allow_private=False)
     if skipped:
         motivos = {}
@@ -3255,7 +3677,9 @@ def run_ip_analysis_normal(selected_fields, api_keys, resume=None):
         )
         return
 
-    fields = selected_fields or (["ip"] + ALL_FIELDS)
+    fields = list(selected_fields) if selected_fields else (["ip"] + ALL_FIELDS)
+    if "ip" not in fields:
+        fields = ["ip"] + fields
     start_idx = (
         int(resume.get("idx", 0)) if (resume and resume.get("mode") == "ips") else 0
     )
@@ -3289,8 +3713,14 @@ def run_ip_analysis_normal(selected_fields, api_keys, resume=None):
                 row = {f: "" for f in fields}
                 row["ip"] = ip
                 if key:
-                    r = vt_get_ip(ip, key)
-                    if r.status_code == 200:
+                    _sleep_rate(rate, rpm=vt_ips_rpm)
+                    try:
+                        r = vt_get_ip(ip, key)
+                    except Exception as _net_err:
+                        print(f"\n[WARN] Error de red en {ip}: {_net_err}")
+                        row["owner"] = "NET_ERROR"
+                        r = None
+                    if r is not None and r.status_code == 200:
                         vt_row = extract_fields_ip(r.json())
                         c_flag, c_reason, c2_flag, c2_reason, score = (
                             analyze_cluster_and_c2(vt_row)
@@ -3307,10 +3737,13 @@ def run_ip_analysis_normal(selected_fields, api_keys, resume=None):
                         for k in vt_row:
                             if k in row:
                                 row[k] = vt_row[k]
-                    else:
+                    elif r is not None:
                         row["owner"] = f"HTTP{r.status_code}"
                 else:
                     row["owner"] = "NO_API_KEY"
+                # Añadir campos canónicos
+                canon_fields = _build_canonical_ip_fields(row)
+                row.update(canon_fields)
                 w.writerow({k: row.get(k, "") for k in fields})
                 save_ckpt(
                     {
@@ -3351,7 +3784,16 @@ def run_ip_analysis_tor(selected_fields, api_keys, resume=None):
             "Pulsa Ctrl+C → guarda checkpoint y termina de forma segura. Reanuda con 9) en el menú."
         )
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
-    raw_lines = read_lines(IP_LIST_FILE)
+    vt_ips_rpm = ask_rpm_limit(
+        "VT requests per minute (IPs+Tor)" if LANG == "en" else "Peticiones VT por minuto (IPs+Tor)",
+        4,
+    )
+    if vt_ips_rpm is None:
+        return
+    rate = [None]
+    # Auto-detectar ruta del fichero de IPs
+    use_path = resolve_ip_list_file()
+    raw_lines = read_lines(use_path)
     ip_list, skipped = filter_valid_public_ips(raw_lines, allow_private=False)
     if skipped:
         motivos = {}
@@ -3372,7 +3814,9 @@ def run_ip_analysis_tor(selected_fields, api_keys, resume=None):
             else f"⚠ No hay IPs válidas en {IP_LIST_FILE}.\n"
         )
         return
-    fields = selected_fields or (["ip"] + ALL_FIELDS)
+    fields = list(selected_fields) if selected_fields else (["ip"] + ALL_FIELDS)
+    if "ip" not in fields:
+        fields = ["ip"] + fields
     start_idx = (
         int(resume.get("idx", 0)) if (resume and resume.get("mode") == "ips_tor") else 0
     )
@@ -3410,8 +3854,14 @@ def run_ip_analysis_tor(selected_fields, api_keys, resume=None):
                 row = {f: "" for f in fields}
                 row["ip"] = ip
                 if key:
-                    r = vt_get_ip(ip, key)
-                    if r.status_code == 200:
+                    _sleep_rate(rate, rpm=vt_ips_rpm)
+                    try:
+                        r = vt_get_ip(ip, key)
+                    except Exception as _net_err:
+                        print(f"\n[WARN] Error de red en {ip}: {_net_err}")
+                        row["owner"] = "NET_ERROR"
+                        r = None
+                    if r is not None and r.status_code == 200:
                         vt_row = extract_fields_ip(r.json())
                         c_flag, c_reason, c2_flag, c2_reason, score = (
                             analyze_cluster_and_c2(vt_row)
@@ -3428,7 +3878,7 @@ def run_ip_analysis_tor(selected_fields, api_keys, resume=None):
                         for k in vt_row:
                             if k in row:
                                 row[k] = vt_row[k]
-                    else:
+                    elif r is not None:
                         row["owner"] = f"HTTP{r.status_code}"
                 else:
                     row["owner"] = "NO_API_KEY"
@@ -3437,6 +3887,9 @@ def run_ip_analysis_tor(selected_fields, api_keys, resume=None):
                 row["tor_source"] = tor_src
                 row["tor_nickname"] = tor_nick
                 row["tor_fingerprint"] = tor_fpr
+                # Añadir campos canónicos
+                canon_fields = _build_canonical_ip_fields(row)
+                row.update(canon_fields)
                 w.writerow({k: row.get(k, "") for k in fields})
                 save_ckpt(
                     {
@@ -3497,17 +3950,18 @@ def run_domains_export(api_keys, resume=None):
             print("⚠ No VT API key found (check IOCS-apikeys.txt).")
         else:
             print("⚠ No encuentro API key VT (revisa IOCS-apikeys.txt).")
-        return
+        return False
 
     # 1) Carga lista de IPs (ajusta a tu fuente real)
-    raw = read_lines(IP_LIST_FILE) if os.path.exists(IP_LIST_FILE) else []
+    use_path = resolve_ip_list_file()
+    raw = read_lines(use_path) if os.path.exists(use_path) else []
     ip_list, skipped = filter_valid_public_ips(raw, allow_private=False)
     if not ip_list:
         if LANG == "en":
-            print(f"⚠ No valid IPs in {IP_LIST_FILE}.\n")
+            print(f"⚠ No valid IPs in {use_path}.\n")
         else:
-            print(f"⚠ No hay IPs válidas en {IP_LIST_FILE}.\n")
-        return
+            print(f"⚠ No hay IPs válidas en {use_path}.\n")
+        return False
     if skipped:
         motivos = {}
         for _, reason in skipped:
@@ -3521,8 +3975,39 @@ def run_domains_export(api_keys, resume=None):
                 f"[DOMAINS] ⏭️ IPs omitidas: {len(skipped)} ({', '.join(f'{k}:{v}' for k,v in motivos.items())})"
             )
 
+    resume_params = (
+        resume.get("params", {}) if (resume and resume.get("mode") == "domains") else {}
+    )
+
+    max_domains_per_ip = ask_positive_limit(
+        "Max domains per IP" if LANG == "en" else "Máximo dominios por IP",
+        int(
+            resume_params.get("max_domains_per_ip", MAX_DOMAINS_PER_IP_DEFAULT)
+            or MAX_DOMAINS_PER_IP_DEFAULT
+        ),
+    )
+    if max_domains_per_ip is None:
+        if LANG == "en":
+            print("\n[PAUSE] DOMAINS cancelled by user.\n")
+        else:
+            print("\n[PAUSA] DOMINIOS cancelado por usuario.\n")
+        return False
+
+    vt_domains_rpm = ask_rpm_limit(
+        "VT requests per minute (DOMAINS)"
+        if LANG == "en"
+        else "Peticiones VT por minuto (DOMINIOS)",
+        int(resume_params.get("vt_domains_rpm", VT_DOMAINS_RPM_DEFAULT) or VT_DOMAINS_RPM_DEFAULT),
+    )
+    if vt_domains_rpm is None:
+        if LANG == "en":
+            print("\n[PAUSE] DOMAINS cancelled by user.\n")
+        else:
+            print("\n[PAUSA] DOMINIOS cancelado por usuario.\n")
+        return False
+
     # 2) Out y checkpoint
-    out_csv = f"{formatted_time}_DOMAINS.csv"
+    out_csv = resume_params.get("out_csv") or f"{formatted_time}_DOMAINS.csv"
     fields = [
         "ip",
         "domain",
@@ -3539,11 +4024,20 @@ def run_domains_export(api_keys, resume=None):
         "vt_verdict",
         "vt_domain_tags",
         "gui",
-    ]
+    ] + CANON_IP_FIELDS
     start_i = (
         int(resume.get("idx", 0)) if (resume and resume.get("mode") == "domains") else 0
     )
-    mode = "a" if start_i > 0 else "w"
+    mode = "a" if (start_i > 0 and os.path.exists(out_csv)) else "w"
+    if start_i > 0:
+        if LANG == "en":
+            print(
+                f"[CKPT] Resuming DOMAINS from index {start_i}/{len(ip_list)} using output {out_csv}"
+            )
+        else:
+            print(
+                f"[CKPT] Reanudando DOMINIOS desde índice {start_i}/{len(ip_list)} usando salida {out_csv}"
+            )
 
     # 3) Barra principal
     pbar = tqdm(
@@ -3554,12 +4048,46 @@ def run_domains_export(api_keys, resume=None):
         dynamic_ncols=True,
     )
     rate = [None]  # estado para _sleep_rate
+    _dom_report_cache: dict = {}  # cache domain → attrs para no repetir llamadas VT
+
+    effective_out_csv = out_csv
+    effective_mode = mode
+    open_attempts = 0
+    while True:
+        try:
+            fh = open(
+                effective_out_csv, effective_mode, newline="", encoding="utf-8"
+            )
+            break
+        except PermissionError:
+            open_attempts += 1
+            if open_attempts >= 3:
+                if LANG == "en":
+                    print(
+                        f"[ERROR] Cannot write output file (locked/in use): {effective_out_csv}"
+                    )
+                else:
+                    print(
+                        f"[ERROR] No puedo escribir el fichero de salida (bloqueado/en uso): {effective_out_csv}"
+                    )
+                return False
+            fallback = _make_unlocked_output_name(out_csv)
+            if LANG == "en":
+                print(
+                    f"[WARN] Output file is locked: {effective_out_csv}. Switching to {fallback}"
+                )
+            else:
+                print(
+                    f"[WARN] El fichero de salida está bloqueado: {effective_out_csv}. Cambio a {fallback}"
+                )
+            effective_out_csv = fallback
+            effective_mode = "w"
 
     written = 0
     try:
-        with open(out_csv, mode, newline="", encoding="utf-8") as fh:
+        with fh:
             w = csv.DictWriter(fh, fieldnames=fields)
-            if start_i == 0:
+            if start_i == 0 or effective_mode == "w":
                 w.writeheader()
 
             for i in pbar:
@@ -3569,19 +4097,35 @@ def run_domains_export(api_keys, resume=None):
                 pages = 0
                 cursor = None
                 total_items = 0
+                written_for_ip = 0
 
                 while True:
-                    _sleep_rate(rate, rpm=4)  # ajusta según tu plan
+                    if (
+                        max_domains_per_ip > 0
+                        and written_for_ip >= max_domains_per_ip
+                    ):
+                        break
+                    _sleep_rate(rate, rpm=vt_domains_rpm)
+                    req_limit = (
+                        min(40, max_domains_per_ip)
+                        if max_domains_per_ip > 0
+                        else 40
+                    )
                     items, cursor, status, err = vt_fetch_ip_resolutions(
-                        ip, key, cursor=cursor, limit=40, timeout_s=15
+                        ip, key, cursor=cursor, limit=req_limit, timeout_s=15
                     )
 
                     if status == 200:
                         pages += 1
                         total_items += len(items)
 
-                        # TODO: tu extracción de atributos (usa _to_iso_utc si hace falta)
+                        # Extracción de atributos de resolución
                         for it in items:
+                            if (
+                                max_domains_per_ip > 0
+                                and written_for_ip >= max_domains_per_ip
+                            ):
+                                break
                             attrs = it.get("attributes", {})
                             domain = (
                                 attrs.get("host_name") or it.get("id") or ""
@@ -3600,14 +4144,49 @@ def run_domains_export(api_keys, resume=None):
                                 else ""
                             )
 
-                            # TODO: stats/flags/categorías (ajusta a tu pipeline)
-                            vt_h = vt_s = vt_m = vt_u = 0
-                            vt_rep = 0
-                            vt_cats = ""
-                            vt_m_flag = 0
-                            vt_s_flag = 0
-                            vt_verdict = "clean"
-                            vt_tags = ""
+                            # Enriquecimiento VT por dominio (cacheado para no repetir)
+                            if domain and domain not in _dom_report_cache:
+                                _sleep_rate(rate, rpm=vt_domains_rpm)
+                                try:
+                                    dr = vt_fetch_domain_report(domain, key)
+                                    if dr.status_code == 200:
+                                        _dom_report_cache[domain] = (
+                                            (dr.json().get("data") or {}).get("attributes") or {}
+                                        )
+                                    else:
+                                        _dom_report_cache[domain] = {}
+                                except Exception:
+                                    _dom_report_cache[domain] = {}
+                            da = _dom_report_cache.get(domain) or {}
+
+                            d_stats = da.get("last_analysis_stats") or {}
+                            vt_h = int(d_stats.get("harmless", 0))
+                            vt_s = int(d_stats.get("suspicious", 0))
+                            vt_m = int(d_stats.get("malicious", 0))
+                            vt_u = int(d_stats.get("undetected", 0))
+                            vt_rep = int(da.get("reputation") or 0)
+                            # categories es dict {vendor: category} → unimos los valores únicos
+                            cats_raw = da.get("categories") or {}
+                            vt_cats = ",".join(sorted(set(cats_raw.values()))) if cats_raw else ""
+                            vt_tags = ",".join(da.get("tags") or [])
+                            vt_m_flag = int(vt_m > 0)
+                            vt_s_flag = int(vt_s > 0)
+                            vt_verdict = (
+                                "malicious" if vt_m > 0
+                                else "suspicious" if vt_s > 0
+                                else "clean"
+                            )
+
+                            partial_row = {
+                                "vt_malicious": vt_m,
+                                "vt_suspicious": vt_s,
+                                "vt_harmless": vt_h,
+                                "vt_reputation": vt_rep,
+                                "vt_categories": vt_cats,
+                                "vt_domain_tags": vt_tags,
+                                "vt_verdict": vt_verdict,
+                            }
+                            canon = _build_canonical_domain_fields(partial_row)
 
                             w.writerow(
                                 {
@@ -3625,10 +4204,12 @@ def run_domains_export(api_keys, resume=None):
                                     "vt_suspicious_flag": vt_s_flag,
                                     "vt_verdict": vt_verdict,
                                     "vt_domain_tags": vt_tags,
-                                    "gui": f"https://www.virustotal.com/gui/ip-address/{ip}",
+                                    "gui": f"https://www.virustotal.com/gui/domain/{domain}",
+                                    **canon,
                                 }
                             )
                             written += 1
+                            written_for_ip += 1
 
                         # update postfix con “IP actual” y páginas
                         pbar.set_postfix_str(
@@ -3649,7 +4230,11 @@ def run_domains_export(api_keys, resume=None):
                         "mode": "domains",
                         "idx": i + 1,
                         "timestamp": time.time(),
-                        "params": {},
+                        "params": {
+                            "out_csv": effective_out_csv,
+                            "max_domains_per_ip": max_domains_per_ip,
+                            "vt_domains_rpm": vt_domains_rpm,
+                        },
                     }
                 )
 
@@ -3657,11 +4242,11 @@ def run_domains_export(api_keys, resume=None):
                 if _hb_every(i, 50):
                     if LANG == "en":
                         print(
-                            f"[DOMAINS] Progress: {i+1}/{len(ip_list)} (output: {out_csv})"
+                            f"[DOMAINS] Progress: {i+1}/{len(ip_list)} (output: {effective_out_csv})"
                         )
                     else:
                         print(
-                            f"[DOMAINS] Progreso: {i+1}/{len(ip_list)} (salida: {out_csv})"
+                            f"[DOMAINS] Progreso: {i+1}/{len(ip_list)} (salida: {effective_out_csv})"
                         )
 
     except KeyboardInterrupt:
@@ -3669,12 +4254,13 @@ def run_domains_export(api_keys, resume=None):
             print("\n[PAUSE] DOMAINS paused. Resume with IP > 9).\n")
         else:
             print("\n[PAUSA] DOMAINS pausado. Reanuda IP > 9).\n")
-        return
+        return False
 
     if LANG == "en":
-        print(f"\n[DOMAINS] Done. {written} rows → {out_csv}")
+        print(f"\n[DOMAINS] Done. {written} rows → {effective_out_csv}")
     else:
-        print(f"\n[DOMAINS] Hecho. {written} filas → {out_csv}")
+        print(f"\n[DOMAINS] Hecho. {written} filas → {effective_out_csv}")
+    return True
 
 
 def run_files_export(api_keys, resume=None):
@@ -3689,26 +4275,59 @@ def run_files_export(api_keys, resume=None):
             print("⚠ No VT API key found (check IOCS-apikeys.txt).")
         else:
             print("⚠ No encuentro API key VT (revisa IOCS-apikeys.txt).")
-        return
+        return False
+
+    resume_params = (
+        resume.get("params", {}) if (resume and resume.get("mode") == "files") else {}
+    )
 
     # 1) Fuente: último *_DOMAINS.csv
     import glob
 
-    cands = sorted(glob.glob("*_DOMAINS.csv"))
-    if not cands:
-        if LANG == "en":
-            print("⚠ No *_DOMAINS.csv found. Run 'Export DOMAINS' first.")
-        else:
-            print("⚠ No hay *_DOMAINS.csv. Ejecuta primero 'Exportar DOMINIOS'.")
-        return
-    src = cands[-1]
+    src = resume_params.get("source_domains_csv")
+    if not src or not os.path.exists(src):
+        cands = sorted(glob.glob("*_DOMAINS.csv"))
+        if not cands:
+            if LANG == "en":
+                print("⚠ No *_DOMAINS.csv found. Run 'Export DOMAINS' first.")
+            else:
+                print("⚠ No hay *_DOMAINS.csv. Ejecuta primero 'Exportar DOMINIOS'.")
+            return False
+        src = cands[-1]
     if LANG == "en":
         print(f"[FILES] Source: {src}")
     else:
         print(f"[FILES] Fuente: {src}")
 
+    max_files_per_domain = ask_positive_limit(
+        "Max files per domain" if LANG == "en" else "Máximo ficheros por dominio",
+        int(
+            resume_params.get("max_files_per_domain", MAX_FILES_PER_DOMAIN_DEFAULT)
+            or MAX_FILES_PER_DOMAIN_DEFAULT
+        ),
+    )
+    if max_files_per_domain is None:
+        if LANG == "en":
+            print("\n[PAUSE] FILES cancelled by user.\n")
+        else:
+            print("\n[PAUSA] FICHEROS cancelado por usuario.\n")
+        return False
+
+    vt_files_rpm = ask_rpm_limit(
+        "VT requests per minute (FILES)"
+        if LANG == "en"
+        else "Peticiones VT por minuto (FICHEROS)",
+        int(resume_params.get("vt_files_rpm", VT_FILES_RPM_DEFAULT) or VT_FILES_RPM_DEFAULT),
+    )
+    if vt_files_rpm is None:
+        if LANG == "en":
+            print("\n[PAUSE] FILES cancelled by user.\n")
+        else:
+            print("\n[PAUSA] FICHEROS cancelado por usuario.\n")
+        return False
+
     # 2) Out y checkpoint
-    out_csv = src.replace("_DOMAINS.csv", "_DOMAINS_FILES.csv")
+    out_csv = resume_params.get("out_csv") or src.replace("_DOMAINS.csv", "_DOMAINS_FILES.csv")
     fields = [
         "domain",
         "relationship",
@@ -3731,7 +4350,7 @@ def run_files_export(api_keys, resume=None):
     start_i = (
         int(resume.get("idx", 0)) if (resume and resume.get("mode") == "files") else 0
     )
-    mode = "a" if start_i > 0 else "w"
+    mode = "a" if (start_i > 0 and os.path.exists(out_csv)) else "w"
 
     # 3) Carga dominios en memoria (podrías stream si son muchos)
     rows = []
@@ -3743,7 +4362,17 @@ def run_files_export(api_keys, resume=None):
             print("⚠ No domains to process.")
         else:
             print("⚠ No hay dominios que procesar.")
-        return
+        return False
+
+    if start_i > 0:
+        if LANG == "en":
+            print(
+                f"[CKPT] Resuming FILES from index {start_i}/{len(rows)} using source {src} and output {out_csv}"
+            )
+        else:
+            print(
+                f"[CKPT] Reanudando FICHEROS desde índice {start_i}/{len(rows)} usando fuente {src} y salida {out_csv}"
+            )
 
     pbar = tqdm(
         range(start_i, len(rows)),
@@ -3753,12 +4382,45 @@ def run_files_export(api_keys, resume=None):
         dynamic_ncols=True,
     )
     rate = [None]
+    effective_out_csv = out_csv
+    effective_mode = mode
+    open_attempts = 0
+    while True:
+        try:
+            fh = open(
+                effective_out_csv, effective_mode, newline="", encoding="utf-8"
+            )
+            break
+        except PermissionError:
+            open_attempts += 1
+            if open_attempts >= 3:
+                if LANG == "en":
+                    print(
+                        f"[ERROR] Cannot write output file (locked/in use): {effective_out_csv}"
+                    )
+                else:
+                    print(
+                        f"[ERROR] No puedo escribir el fichero de salida (bloqueado/en uso): {effective_out_csv}"
+                    )
+                return False
+            fallback = _make_unlocked_output_name(out_csv)
+            if LANG == "en":
+                print(
+                    f"[WARN] Output file is locked: {effective_out_csv}. Switching to {fallback}"
+                )
+            else:
+                print(
+                    f"[WARN] El fichero de salida está bloqueado: {effective_out_csv}. Cambio a {fallback}"
+                )
+            effective_out_csv = fallback
+            effective_mode = "w"
+
     written = 0
 
     try:
-        with open(out_csv, mode, newline="", encoding="utf-8") as fh:
+        with fh:
             w = csv.DictWriter(fh, fieldnames=fields)
-            if start_i == 0:
+            if start_i == 0 or effective_mode == "w":
                 w.writeheader()
 
             for i in pbar:
@@ -3770,7 +4432,12 @@ def run_files_export(api_keys, resume=None):
                             "mode": "files",
                             "idx": i + 1,
                             "timestamp": time.time(),
-                            "params": {},
+                            "params": {
+                                "source_domains_csv": src,
+                                "out_csv": effective_out_csv,
+                                "max_files_per_domain": max_files_per_domain,
+                                "vt_files_rpm": vt_files_rpm,
+                            },
                         }
                     )
                     continue
@@ -3778,14 +4445,25 @@ def run_files_export(api_keys, resume=None):
                 # === VT relations (domain → files) paginado ===
                 base = "https://www.virustotal.com/api/v3"
                 url = f"{base}/domains/{domain}/relationships/communicating_files"
-                params = {"limit": 40}
+                page_limit = (
+                    min(40, max_files_per_domain)
+                    if max_files_per_domain > 0
+                    else 40
+                )
+                params = {"limit": page_limit}
                 headers = {"x-apikey": key, "User-Agent": "iocsofspades/files-export"}
                 pages = 0
                 total_items = 0
+                written_for_domain = 0
                 next_url = url
 
                 while True:
-                    _sleep_rate(rate, rpm=4)
+                    if (
+                        max_files_per_domain > 0
+                        and written_for_domain >= max_files_per_domain
+                    ):
+                        break
+                    _sleep_rate(rate, rpm=vt_files_rpm)
                     try:
                         r = requests.get(
                             next_url, headers=headers, params=params, timeout=15
@@ -3810,6 +4488,11 @@ def run_files_export(api_keys, resume=None):
                     pages += 1
 
                     for it in items:
+                        if (
+                            max_files_per_domain > 0
+                            and written_for_domain >= max_files_per_domain
+                        ):
+                            break
                         attrs = it.get("attributes", {})
                         fid = it.get("id") or ""
                         mname = attrs.get("meaningful_name") or ""
@@ -3852,6 +4535,7 @@ def run_files_export(api_keys, resume=None):
                             }
                         )
                         written += 1
+                        written_for_domain += 1
 
                     next_url = (j.get("links") or {}).get("next")
                     pbar.set_postfix_str(
@@ -3865,17 +4549,22 @@ def run_files_export(api_keys, resume=None):
                         "mode": "files",
                         "idx": i + 1,
                         "timestamp": time.time(),
-                        "params": {},
+                        "params": {
+                            "source_domains_csv": src,
+                            "out_csv": effective_out_csv,
+                            "max_files_per_domain": max_files_per_domain,
+                            "vt_files_rpm": vt_files_rpm,
+                        },
                     }
                 )
                 if _hb_every(i, 50):
                     if LANG == "en":
                         print(
-                            f"[FILES] Progress: {i+1}/{len(rows)} (output: {out_csv})"
+                            f"[FILES] Progress: {i+1}/{len(rows)} (output: {effective_out_csv})"
                         )
                     else:
                         print(
-                            f"[FILES] Progreso: {i+1}/{len(rows)} (salida: {out_csv})"
+                            f"[FILES] Progreso: {i+1}/{len(rows)} (salida: {effective_out_csv})"
                         )
 
     except KeyboardInterrupt:
@@ -3883,12 +4572,13 @@ def run_files_export(api_keys, resume=None):
             print("\n[PAUSE] FILES paused. Resume with IP > 9).\n")
         else:
             print("\n[PAUSA] FILES pausado. Reanuda IP > 9).\n")
-        return
+        return False
 
     if LANG == "en":
-        print(f"\n[FILES] Done. {written} rows → {out_csv}")
+        print(f"\n[FILES] Done. {written} rows → {effective_out_csv}")
     else:
-        print(f"\n[FILES] Hecho. {written} filas → {out_csv}")
+        print(f"\n[FILES] Hecho. {written} filas → {effective_out_csv}")
+    return True
 
 
 # === HASH (VT files) — con checkpoint para lista
@@ -4341,7 +5031,7 @@ def main_menu(ssl_status: str):
         print("7) Configure OSINT sources — Choose your arsenal")
         print("x) Clear checkpoint — Reset the stage")
         print("0) Exit — Leave the battlefield")
-        return input("\nChoose your weapon: ").strip()
+        return safe_input("\nChoose your weapon: ", default="", on_interrupt="default")
     else:
         print(f"\n=== {APP_NAME} — MENÚ PRINCIPAL (IOCs) ===")
         print("1) IP")
@@ -4353,7 +5043,9 @@ def main_menu(ssl_status: str):
         print("7) Configurar fuentes OSINT — Elige tu arsenal")
         print("x) Borrar checkpoint")
         print("0) Salir")
-        return input("\nSelecciona una opción: ").strip()
+        return safe_input(
+            "\nSelecciona una opción: ", default="", on_interrupt="default"
+        )
 
 
 def debug_menu():
@@ -4368,7 +5060,7 @@ def debug_menu():
         print("7) Refresh OSINT feeds now")
         print("8) Back")
         print("9) Export OSINT hits (last *_ULTRA_OSINT.csv)")
-        return input("\nChoose an option: ").strip()
+        return safe_input("\nChoose an option: ", default="8", on_interrupt="default")
     else:
         print("\n=== MENÚ DEBUG OSINT ===")
         print("1) Ver ruta de caché")
@@ -4380,7 +5072,9 @@ def debug_menu():
         print("7) Refrescar feeds OSINT ahora")
         print("8) Volver")
         print("9) Exportar hits OSINT (último *_ULTRA_OSINT.csv)")
-        return input("\nSelecciona una opción: ").strip()
+        return safe_input(
+            "\nSelecciona una opción: ", default="8", on_interrupt="default"
+        )
 
 
 def handle_debug_menu():
@@ -4446,7 +5140,7 @@ def ip_menu(fast_flag: bool, ssl_status: str):
         print("8) Export EVERYTHING (domains by IP + files)")
         print("9) Resume (IPs / DOMAINS / FILES)")
         print("10) Back")
-        return input("\nChoose an option: ").strip()
+        return safe_input("\nChoose an option: ", default="10", on_interrupt="default")
     else:
         print(f"\n=== MENÚ IPs  [SSL: {ssl_status.upper()}] ===")
         print("1) Analizar IPs en VirusTotal (VT)")
@@ -4459,7 +5153,9 @@ def ip_menu(fast_flag: bool, ssl_status: str):
         print("8) Exportar TODO (dominios por IP + ficheros)")
         print("9) Reanudar (IPs / DOMAINS / FILES)")
         print("10) Volver")
-        return input("\nSelecciona una opción: ").strip()
+        return safe_input(
+            "\nSelecciona una opción: ", default="10", on_interrupt="default"
+        )
 
 
 def domain_menu(ssl_status: str):
@@ -4469,14 +5165,16 @@ def domain_menu(ssl_status: str):
         print("2) Analyze DOMAINS in OTHER SOURCES (OSINT)")
         print("3) Resume (DOMAIN list / DOMAIN OSINT)")
         print("4) Back")
-        return input("\nChoose an option: ").strip()
+        return safe_input("\nChoose an option: ", default="4", on_interrupt="default")
     else:
         print(f"\n=== MENÚ DOMINIOS  [SSL: {ssl_status.upper()}] ===")
         print("1) Consultar lista de dominios en VirusTotal (dominios.txt)")
         print("2) Analizar DOMINIOS en OTRAS FUENTES (OSINT)")
         print("3) Reanudar (DOMINIOS lista / DOMINIOS OSINT)")
         print("4) Volver")
-        return input("\nSelecciona una opción: ").strip()
+        return safe_input(
+            "\nSelecciona una opción: ", default="4", on_interrupt="default"
+        )
 
 
 def hash_menu(ssl_status: str):
@@ -4487,7 +5185,7 @@ def hash_menu(ssl_status: str):
         print("3) Analyze HASHES in OTHER SOURCES (OSINT)")
         print("4) Resume (HASH list / HASH OSINT)")
         print("5) Back")
-        return input("\nChoose an option: ").strip()
+        return safe_input("\nChoose an option: ", default="5", on_interrupt="default")
     else:
         print(f"\n=== MENÚ HASH  [SSL: {ssl_status.upper()}] ===")
         print("1) Consultar un hash en VirusTotal (MD5/SHA1/SHA256)")
@@ -4495,7 +5193,9 @@ def hash_menu(ssl_status: str):
         print("3) Analizar HASHES en OTRAS FUENTES (OSINT)")
         print("4) Reanudar (HASH lista / HASH OSINT)")
         print("5) Volver")
-        return input("\nSelecciona una opción: ").strip()
+        return safe_input(
+            "\nSelecciona una opción: ", default="5", on_interrupt="default"
+        )
 
 
 def vt_check_capabilities(api_key):
@@ -4832,13 +5532,17 @@ def main():
                 elif sub == "7":
                     run_files_export(api_keys)
                 elif sub == "8":
-                    run_domains_export(api_keys)
-                    run_files_export(api_keys)
+                    domains_ok = run_domains_export(api_keys)
+                    if domains_ok:
+                        run_files_export(api_keys)
                 elif sub == "9":
-                    ck = load_ckpt()
+                    ck = load_latest_ckpt(
+                        ["ips", "ips_tor", "ip_osint", "domains", "files"]
+                    )
                     if not ck or ck.get("mode") not in (
                         "ips",
                         "ips_tor",
+                        "ip_osint",
                         "domains",
                         "files",
                     ):
@@ -4856,6 +5560,8 @@ def main():
                             run_ip_analysis_tor(
                                 selected_fields_ips, api_keys, resume=ck
                             )
+                        elif mode == "ip_osint":
+                            run_ip_osint_scan(resume=ck)
                         elif mode == "domains":
                             run_domains_export(api_keys, resume=ck)
                         elif mode == "files":
@@ -4889,22 +5595,17 @@ def main():
 
         elif choice == "8":
             # Exportar TODO: dominios y ficheros, con checkpoint
-            run_domains_export(
+            ck_domains = load_ckpt("domains")
+            ck_files = load_ckpt("files")
+            domains_ok = run_domains_export(
                 api_keys,
-                resume=(
-                    load_ckpt()
-                    if load_ckpt() and load_ckpt().get("mode") == "domains"
-                    else None
-                ),
+                resume=(ck_domains if ck_domains else None),
             )
-            run_files_export(
-                api_keys,
-                resume=(
-                    load_ckpt()
-                    if load_ckpt() and load_ckpt().get("mode") == "files"
-                    else None
-                ),
-            )
+            if domains_ok:
+                run_files_export(
+                    api_keys,
+                    resume=(ck_files if ck_files else None),
+                )
 
         # -------------------  MENU DOMINIOS  ---------------------
         elif choice == "2":
@@ -4921,7 +5622,7 @@ def main():
                         print("\n❌ BLOQUEADO por SSL intercept.\n")
                     continue
                 if ssl_status == "mitm" and sub == "3":
-                    ck = load_ckpt()
+                    ck = load_latest_ckpt(["domains_list", "domains_osint"])
                     if ck and ck.get("mode") == "domains_list":
                         if LANG == "en":
                             print("\n❌ BLOCKED by SSL intercept.\n")
@@ -4968,7 +5669,7 @@ def main():
                     run_domain_osint_lookup(list_file=path, resume=None)
 
                 elif sub == "3":
-                    ck = load_ckpt()
+                    ck = load_latest_ckpt(["domains_list", "domains_osint"])
                     if not ck or ck.get("mode") not in (
                         "domains_list",
                         "domains_osint",
@@ -5022,7 +5723,7 @@ def main():
                 if ssl_status == "mitm" and sub in ("1", "2"):
                     blocked_hash = True
                 elif ssl_status == "mitm" and sub == "4":
-                    ck = load_ckpt()
+                    ck = load_latest_ckpt(["hash_list", "hash_osint"])
                     if ck and ck.get("mode") == "hash_list":
                         blocked_hash = True
 
@@ -5097,7 +5798,7 @@ def main():
                     run_hash_osint_lookup(list_file=path, resume=None)
 
                 elif sub == "4":
-                    ck = load_ckpt()
+                    ck = load_latest_ckpt(["hash_list", "hash_osint"])
                     if not ck or ck.get("mode") not in ("hash_list", "hash_osint"):
                         print(
                             "[CKPT] No checkpoint.\n"
