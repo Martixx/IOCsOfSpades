@@ -760,28 +760,91 @@ def read_lines(path):
         return [x.strip() for x in f if x.strip()]
 
 
+# Checkpoint por modo: cada tipo de proceso usa su propio fichero para evitar
+# que procesos paralelos (IPs, DOMAINS, FILES…) se sobreescriban entre sí.
+_CKPT_BY_MODE: dict[str, str] = {
+    "ips":           ".iocs_ckpt_ips.json",
+    "ips_tor":       ".iocs_ckpt_ips.json",
+    "ip_osint":      ".iocs_ckpt_ips.json",
+    "domains":       ".iocs_ckpt_domains.json",
+    "domains_osint": ".iocs_ckpt_domains.json",
+    "domains_list":  ".iocs_ckpt_domains.json",
+    "files":         ".iocs_ckpt_files.json",
+    "hash_list":     ".iocs_ckpt_hash.json",
+    "hash_osint":    ".iocs_ckpt_hash.json",
+}
+_ALL_CKPT_FILES: list[str] = list(dict.fromkeys(_CKPT_BY_MODE.values())) + [CKPT_FILE]
+
+
+def _ckpt_file_for_mode(mode: str) -> str:
+    return _CKPT_BY_MODE.get(mode, CKPT_FILE)
+
+
 def save_ckpt(data: dict):
     try:
-        with open(CKPT_FILE, "w", encoding="utf-8") as fh:
+        path = _ckpt_file_for_mode(data.get("mode", ""))
+        with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2)
     except Exception:
         pass
 
 
-def load_ckpt():
+def load_ckpt(mode: str | None = None):
+    """Carga checkpoint. Con mode, busca en el fichero específico de ese modo.
+    Sin mode, devuelve el más reciente de todos los ficheros disponibles."""
     try:
-        if not os.path.exists(CKPT_FILE):
-            return None
-        with open(CKPT_FILE, "r", encoding="utf-8") as fh:
-            return json.load(fh)
+        if mode is not None:
+            path = _ckpt_file_for_mode(mode)
+            if not os.path.exists(path):
+                path = CKPT_FILE  # fallback legacy
+            if not os.path.exists(path):
+                return None
+            with open(path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        # Sin mode: devuelve el más reciente entre todos los ficheros
+        best, best_ts = None, -1.0
+        for f in _ALL_CKPT_FILES:
+            if not os.path.exists(f):
+                continue
+            try:
+                with open(f, "r", encoding="utf-8") as fh:
+                    d = json.load(fh)
+                ts = float(d.get("timestamp", 0))
+                if ts > best_ts:
+                    best_ts, best = ts, d
+            except Exception:
+                pass
+        return best
     except Exception:
         return None
 
 
+def _list_available_ckpts(modes: list[str] | None = None) -> list[dict]:
+    """Devuelve todos los checkpoints guardados, ordenados por timestamp desc.
+    Si modes se especifica, solo devuelve los que tengan un modo de esa lista."""
+    result = []
+    for f in _ALL_CKPT_FILES:
+        if not os.path.exists(f):
+            continue
+        try:
+            with open(f, "r", encoding="utf-8") as fh:
+                d = json.load(fh)
+            if modes is None or d.get("mode") in modes:
+                result.append(d)
+        except Exception:
+            pass
+    result.sort(key=lambda d: float(d.get("timestamp", 0)), reverse=True)
+    return result
+
+
 def clear_ckpt():
     try:
-        if os.path.exists(CKPT_FILE):
-            os.remove(CKPT_FILE)
+        removed = 0
+        for f in _ALL_CKPT_FILES:
+            if os.path.exists(f):
+                os.remove(f)
+                removed += 1
+        if removed:
             print("[CKPT] Cleared." if LANG == "en" else "[CKPT] Borrado.")
     except Exception:
         pass
@@ -2326,6 +2389,17 @@ def run_ip_analysis_normal(selected_fields, api_keys, resume=None):
         print("\n━━━━━━━━  PAUSA / REANUDAR  ━━━━━━━━")
         print("Ctrl+C → guarda checkpoint y termina. Reanuda desde IP > 8).")
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+    _rpm_str = safe_input(
+        "VT requests per minute [default 4, higher=faster]: "
+        if LANG == "en"
+        else "Peticiones VT por minuto (VT) [por defecto 4, más alto=más rápido]: ",
+        default="4",
+        on_interrupt="back",
+    )
+    if _rpm_str is None:
+        return
+    _user_rpm = max(1, int(_rpm_str) if str(_rpm_str).strip().isdigit() else 4)
+    rate = [None]  # estado para _sleep_rate
     ip_list_file = resolve_ip_list_file()
     raw_lines = read_lines(ip_list_file) if os.path.exists(ip_list_file) else []
     ip_list, skipped = filter_valid_public_ips(raw_lines, allow_private=False)
@@ -2383,6 +2457,7 @@ def run_ip_analysis_normal(selected_fields, api_keys, resume=None):
                 row = {f: "" for f in fields}
                 row["ip"] = ip
                 if key:
+                    _sleep_rate(rate, rpm=_user_rpm)
                     r = vt_get_ip(ip, key)
                     if r.status_code == 200:
                         vt_row = extract_fields_ip(r.json())
@@ -2446,6 +2521,17 @@ def run_ip_analysis_tor(selected_fields, api_keys, resume=None):
             "Pulsa Ctrl+C → guarda checkpoint y termina de forma segura. Reanuda con 9) en el menú."
         )
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+    _rpm_str = safe_input(
+        "VT requests per minute [default 4, higher=faster]: "
+        if LANG == "en"
+        else "Peticiones VT por minuto (VT+Tor) [por defecto 4, más alto=más rápido]: ",
+        default="4",
+        on_interrupt="back",
+    )
+    if _rpm_str is None:
+        return
+    _user_rpm = max(1, int(_rpm_str) if str(_rpm_str).strip().isdigit() else 4)
+    rate = [None]  # estado para _sleep_rate
     ip_list_file = resolve_ip_list_file()
     raw_lines = read_lines(ip_list_file) if os.path.exists(ip_list_file) else []
     ip_list, skipped = filter_valid_public_ips(raw_lines, allow_private=False)
@@ -2506,6 +2592,7 @@ def run_ip_analysis_tor(selected_fields, api_keys, resume=None):
                 row = {f: "" for f in fields}
                 row["ip"] = ip
                 if key:
+                    _sleep_rate(rate, rpm=_user_rpm)
                     r = vt_get_ip(ip, key)
                     if r.status_code == 200:
                         vt_row = extract_fields_ip(r.json())
@@ -2597,6 +2684,32 @@ def run_domains_export(api_keys, resume=None):
             print("⚠ No encuentro API key VT (revisa IOCS-apikeys.txt).")
         return
 
+    # 0b) Parámetros interactivos (omitir si se reanuda un checkpoint)
+    if not resume:
+        _max_str = safe_input(
+            "Max domains per IP [default 200, 0=unlimited]: "
+            if LANG == "en"
+            else "Máximo dominios por IP [por defecto 200, 0=sin límite]: ",
+            default="200",
+            on_interrupt="back",
+        )
+        if _max_str is None:
+            return
+        _max_domains = int(_max_str) if str(_max_str).strip().isdigit() else 200
+        _rpm_str = safe_input(
+            "VT requests per minute (DOMAINS) [default 4, higher=faster]: "
+            if LANG == "en"
+            else "Peticiones VT por minuto (DOMAINS) [por defecto 4, más alto=más rápido]: ",
+            default="4",
+            on_interrupt="back",
+        )
+        if _rpm_str is None:
+            return
+        _user_rpm = max(1, int(_rpm_str) if str(_rpm_str).strip().isdigit() else 4)
+    else:
+        _max_domains = int(resume.get("params", {}).get("max_domains", 200) or 200)
+        _user_rpm = int(resume.get("params", {}).get("rpm", 4) or 4)
+
     # 1) Carga lista de IPs (ajusta a tu fuente real)
     ip_list_file = resolve_ip_list_file()
     raw = read_lines(ip_list_file) if os.path.exists(ip_list_file) else []
@@ -2621,12 +2734,21 @@ def run_domains_export(api_keys, resume=None):
             )
 
     # 2) Out y checkpoint
-    out_csv = f"{formatted_time}_DOMAINS.csv"
+    resume_params = (
+        resume.get("params", {}) if (resume and resume.get("mode") == "domains") else {}
+    )
+    _saved_out = resume_params.get("out_csv")
+    out_csv = (
+        _saved_out
+        if (_saved_out and os.path.exists(_saved_out))
+        else f"{formatted_time}_DOMAINS.csv"
+    )
     fields = [
         "ip",
         "domain",
         "first_seen",
         "last_resolved",
+        "domain_creation_date",
         "vt_harmless",
         "vt_suspicious",
         "vt_malicious",
@@ -2642,7 +2764,7 @@ def run_domains_export(api_keys, resume=None):
     start_i = (
         int(resume.get("idx", 0)) if (resume and resume.get("mode") == "domains") else 0
     )
-    mode = "a" if start_i > 0 else "w"
+    mode = "a" if (start_i > 0 and os.path.exists(out_csv)) else "w"
 
     # 3) Barra principal
     pbar = tqdm(
@@ -2653,12 +2775,13 @@ def run_domains_export(api_keys, resume=None):
         dynamic_ncols=True,
     )
     rate = [None]  # estado para _sleep_rate
+    _dom_creation_cache: dict = {}  # cache domain → creation_date para no repetir llamadas
 
     written = 0
     try:
         with open(out_csv, mode, newline="", encoding="utf-8") as fh:
             w = csv.DictWriter(fh, fieldnames=fields)
-            if start_i == 0:
+            if mode == "w":
                 w.writeheader()
 
             for i in pbar:
@@ -2670,7 +2793,7 @@ def run_domains_export(api_keys, resume=None):
                 total_items = 0
 
                 while True:
-                    _sleep_rate(rate, rpm=4)  # ajusta según tu plan
+                    _sleep_rate(rate, rpm=_user_rpm)
                     items, cursor, status, err = vt_fetch_ip_resolutions(
                         ip, key, cursor=cursor, limit=40, timeout_s=15
                     )
@@ -2699,6 +2822,23 @@ def run_domains_export(api_keys, resume=None):
                                 else ""
                             )
 
+                            # Fecha de creación del dominio (WHOIS via VT, cacheada por dominio único)
+                            if domain and domain not in _dom_creation_cache:
+                                _sleep_rate(rate, rpm=_user_rpm)
+                                try:
+                                    dr = vt_fetch_domain_report(domain, key)
+                                    if dr.status_code == 200:
+                                        da = (dr.json().get("data") or {}).get("attributes") or {}
+                                        cd_raw = da.get("creation_date") or ""
+                                        _dom_creation_cache[domain] = (
+                                            _to_iso_utc(cd_raw) if cd_raw else ""
+                                        )
+                                    else:
+                                        _dom_creation_cache[domain] = ""
+                                except Exception:
+                                    _dom_creation_cache[domain] = ""
+                            domain_creation_date = _dom_creation_cache.get(domain, "")
+
                             # TODO: stats/flags/categorías (ajusta a tu pipeline)
                             vt_h = vt_s = vt_m = vt_u = 0
                             vt_rep = 0
@@ -2714,6 +2854,7 @@ def run_domains_export(api_keys, resume=None):
                                     "domain": domain,
                                     "first_seen": first_seen,
                                     "last_resolved": last_resolved,
+                                    "domain_creation_date": domain_creation_date,
                                     "vt_harmless": vt_h,
                                     "vt_suspicious": vt_s,
                                     "vt_malicious": vt_m,
@@ -2748,7 +2889,11 @@ def run_domains_export(api_keys, resume=None):
                         "mode": "domains",
                         "idx": i + 1,
                         "timestamp": time.time(),
-                        "params": {},
+                        "params": {
+                            "out_csv": out_csv,
+                            "max_domains": _max_domains,
+                            "rpm": _user_rpm,
+                        },
                     }
                 )
 
@@ -2789,6 +2934,21 @@ def run_files_export(api_keys, resume=None):
         else:
             print("⚠ No encuentro API key VT (revisa IOCS-apikeys.txt).")
         return
+
+    # 0b) Parámetros interactivos (omitir si se reanuda)
+    if not resume:
+        _rpm_str = safe_input(
+            "VT requests per minute (FILES) [default 4, higher=faster]: "
+            if LANG == "en"
+            else "Peticiones VT por minuto (FILES) [por defecto 4, más alto=más rápido]: ",
+            default="4",
+            on_interrupt="back",
+        )
+        if _rpm_str is None:
+            return
+        _user_rpm = max(1, int(_rpm_str) if str(_rpm_str).strip().isdigit() else 4)
+    else:
+        _user_rpm = int(resume.get("params", {}).get("rpm", 4) or 4)
 
     # 1) Fuente: último *_DOMAINS.csv
     import glob
@@ -2836,6 +2996,20 @@ def run_files_export(api_keys, resume=None):
     rows = []
     with open(src, "r", encoding="utf-8", newline="") as f:
         r = csv.DictReader(f)
+        if r.fieldnames and "domain" not in r.fieldnames:
+            if LANG == "en":
+                print(
+                    f"⚠ Source CSV '{src}' is missing the 'domain' header.\n"
+                    "   This usually means the DOMAINS export was interrupted before writing any row.\n"
+                    "   Re-run Export DOMAINS to regenerate it."
+                )
+            else:
+                print(
+                    f"⚠ El CSV '{src}' no tiene columna 'domain' — probablemente le falta la cabecera.\n"
+                    "   Esto ocurre si la exportación de DOMINIOS se interrumpió antes de escribir filas.\n"
+                    "   Regenera el CSV con 'Exportar DOMINIOS'."
+                )
+            return False
         rows = list(r)
     if not rows:
         if LANG == "en":
@@ -2869,102 +3043,117 @@ def run_files_export(api_keys, resume=None):
                             "mode": "files",
                             "idx": i + 1,
                             "timestamp": time.time(),
-                            "params": {},
+                            "params": {"rpm": _user_rpm},
                         }
                     )
                     continue
 
-                # === VT relations (domain → files) paginado ===
+                # === VT relations (domain → files) — tres relaciones ===
                 base = "https://www.virustotal.com/api/v3"
-                url = f"{base}/domains/{domain}/relationships/communicating_files"
-                params = {"limit": 40}
-                headers = {"x-apikey": key, "User-Agent": "iocsofspades/files-export"}
-                pages = 0
-                total_items = 0
-                next_url = url
+                req_headers = {"x-apikey": key, "User-Agent": "iocsofspades/files-export"}
+                dom_total = 0
 
-                while True:
-                    _sleep_rate(rate, rpm=4)
-                    try:
-                        r = requests.get(
-                            next_url, headers=headers, params=params, timeout=15
-                        )
-                    except Exception as e:
-                        print(f"[WARN] Files err {domain}: {e}")
-                        break
+                for rel in ("communicating_files", "referrer_files", "downloaded_files"):
+                    first_page_url = f"{base}/domains/{domain}/relationships/{rel}"
+                    next_url: str | None = first_page_url
+                    pages = 0
+                    rel_items = 0
 
-                    if r.status_code != 200:
-                        msg = ""
+                    while next_url:
+                        _sleep_rate(rate, rpm=_user_rpm)
+                        # Solo en la primera página pasamos params; páginas siguientes
+                        # tienen cursor embebido en la URL devuelta por VT.
+                        req_params = {"limit": 40} if next_url == first_page_url else None
                         try:
-                            j = r.json()
-                            msg = ((j.get("error") or {}).get("message")) or ""
-                        except Exception:
-                            msg = r.text[:200]
-                        print(f"[WARN] Files HTTP{r.status_code} {domain} → {msg}")
-                        break
+                            resp = requests.get(
+                                next_url,
+                                headers=req_headers,
+                                params=req_params,
+                                timeout=15,
+                            )
+                        except Exception as exc:
+                            print(f"[WARN] Files err {domain}/{rel}: {exc}")
+                            break
 
-                    j = r.json()
-                    items = j.get("data") or []
-                    total_items += len(items)
-                    pages += 1
+                        if resp.status_code != 200:
+                            msg = ""
+                            try:
+                                ej = resp.json()
+                                msg = ((ej.get("error") or {}).get("message")) or ""
+                            except Exception:
+                                msg = resp.text[:200]
+                            print(
+                                f"[WARN] Files HTTP{resp.status_code} {domain}/{rel} → {msg}"
+                            )
+                            break
 
-                    for it in items:
-                        attrs = it.get("attributes", {})
-                        fid = it.get("id") or ""
-                        mname = attrs.get("meaningful_name") or ""
-                        fsize = int(attrs.get("size") or 0)
-                        stats = attrs.get("last_analysis_stats") or {}
-                        fh_ = int(stats.get("harmless", 0))
-                        fs_ = int(stats.get("suspicious", 0))
-                        fm_ = int(stats.get("malicious", 0))
-                        fu_ = int(stats.get("undetected", 0))
-                        fs_raw = attrs.get("first_submission_date") or ""
-                        ls_raw = attrs.get("last_submission_date") or ""
-                        la_raw = attrs.get("last_analysis_date") or ""
-                        file_first = _to_iso_utc(fs_raw) if fs_raw else ""
-                        file_last = _to_iso_utc(ls_raw) if ls_raw else ""
-                        file_la = _to_iso_utc(la_raw) if la_raw else ""
+                        j = resp.json()
+                        items = j.get("data") or []
+                        rel_items += len(items)
+                        pages += 1
 
-                        w.writerow(
-                            {
-                                "domain": domain,
-                                "relationship": "communicating_files",
-                                "file_id": fid,
-                                "file_gui": f"https://www.virustotal.com/gui/file/{fid}",
-                                "file_name": mname,
-                                "file_size": fsize,
-                                "file_size_human": human_size(fsize),
-                                "file_harmless": fh_,
-                                "file_suspicious": fs_,
-                                "file_malicious": fm_,
-                                "file_undetected": fu_,
-                                "file_malicious_flag": int(fm_ > 0),
-                                "file_suspicious_flag": int(fs_ > 0),
-                                "file_verdict": (
-                                    "malicious"
-                                    if fm_ > 0
-                                    else ("suspicious" if fs_ > 0 else "clean")
-                                ),
-                                "file_first_submission": file_first,
-                                "file_last_submission": file_last,
-                                "file_last_analysis": file_la,
-                            }
+                        for it in items:
+                            attrs = it.get("attributes", {})
+                            fid = it.get("id") or ""
+                            mname = attrs.get("meaningful_name") or ""
+                            fsize = int(attrs.get("size") or 0)
+                            stats = attrs.get("last_analysis_stats") or {}
+                            fh_ = int(stats.get("harmless", 0))
+                            fs_ = int(stats.get("suspicious", 0))
+                            fm_ = int(stats.get("malicious", 0))
+                            fu_ = int(stats.get("undetected", 0))
+                            fs_raw = attrs.get("first_submission_date") or ""
+                            ls_raw = attrs.get("last_submission_date") or ""
+                            la_raw = attrs.get("last_analysis_date") or ""
+                            file_first = _to_iso_utc(fs_raw) if fs_raw else ""
+                            file_last = _to_iso_utc(ls_raw) if ls_raw else ""
+                            file_la = _to_iso_utc(la_raw) if la_raw else ""
+
+                            w.writerow(
+                                {
+                                    "domain": domain,
+                                    "relationship": rel,
+                                    "file_id": fid,
+                                    "file_gui": f"https://www.virustotal.com/gui/file/{fid}",
+                                    "file_name": mname,
+                                    "file_size": fsize,
+                                    "file_size_human": human_size(fsize),
+                                    "file_harmless": fh_,
+                                    "file_suspicious": fs_,
+                                    "file_malicious": fm_,
+                                    "file_undetected": fu_,
+                                    "file_malicious_flag": int(fm_ > 0),
+                                    "file_suspicious_flag": int(fs_ > 0),
+                                    "file_verdict": (
+                                        "malicious"
+                                        if fm_ > 0
+                                        else ("suspicious" if fs_ > 0 else "clean")
+                                    ),
+                                    "file_first_submission": file_first,
+                                    "file_last_submission": file_last,
+                                    "file_last_analysis": file_la,
+                                }
+                            )
+                            written += 1
+                            dom_total += 1
+
+                        next_url = (j.get("links") or {}).get("next")
+
+                    if rel_items > 0:
+                        print(
+                            f"  [{domain}] {rel}: {rel_items} file(s) across {pages} page(s)"
                         )
-                        written += 1
 
-                    next_url = (j.get("links") or {}).get("next")
-                    pbar.set_postfix_str(
-                        f"domain={domain} pages={pages} items={total_items}"
-                    )
-                    if not next_url:
-                        break
+                pbar.set_postfix_str(f"domain={domain} total_files={dom_total}")
+                if dom_total == 0:
+                    print(f"  [{domain}] → 0 files in all 3 relationships (normal for clean domains)")
 
                 save_ckpt(
                     {
                         "mode": "files",
                         "idx": i + 1,
                         "timestamp": time.time(),
-                        "params": {},
+                        "params": {"rpm": _user_rpm},
                     }
                 )
                 if _hb_every(i, 50):
@@ -3778,31 +3967,79 @@ def main():
                     run_domains_export(api_keys)
                     run_files_export(api_keys)
                 elif sub == "9":
-                    ck = load_ckpt()
-                    if not ck or ck.get("mode") not in (
-                        "ips",
-                        "ips_tor",
-                        "domains",
-                        "files",
-                    ):
-                        if LANG == "en":
-                            print("[CKPT] No checkpoint found.\n")
-                        else:
-                            print("[CKPT] No hay checkpoint.\n")
-                    else:
-                        mode = ck.get("mode")
-                        if mode == "ips":
+                    import datetime as _dt_ckpt
+                    _ckpts = _list_available_ckpts(
+                        modes=["ips", "ips_tor", "domains", "files"]
+                    )
+                    if not _ckpts:
+                        print(
+                            "[CKPT] No checkpoint found.\n"
+                            if LANG == "en"
+                            else "[CKPT] No hay checkpoint.\n"
+                        )
+                    elif len(_ckpts) == 1:
+                        ck = _ckpts[0]
+                        _mode = ck.get("mode")
+                        if _mode == "ips":
                             run_ip_analysis_normal(
                                 selected_fields_ips, api_keys, resume=ck
                             )
-                        elif mode == "ips_tor":
+                        elif _mode == "ips_tor":
                             run_ip_analysis_tor(
                                 selected_fields_ips, api_keys, resume=ck
                             )
-                        elif mode == "domains":
+                        elif _mode == "domains":
                             run_domains_export(api_keys, resume=ck)
-                        elif mode == "files":
+                        elif _mode == "files":
                             run_files_export(api_keys, resume=ck)
+                    else:
+                        # Varios checkpoints: mostrar lista para elegir
+                        print(
+                            "\n[CKPT] Multiple checkpoints found:"
+                            if LANG == "en"
+                            else "\n[CKPT] Hay varios checkpoints disponibles:"
+                        )
+                        for _n, _c in enumerate(_ckpts, 1):
+                            _ts = _dt_ckpt.datetime.fromtimestamp(
+                                float(_c.get("timestamp", 0))
+                            ).strftime("%Y-%m-%d %H:%M")
+                            print(
+                                f"  {_n}) [{_c.get('mode','?')}]  idx={_c.get('idx','?')}  saved: {_ts}"
+                                if LANG == "en"
+                                else f"  {_n}) [{_c.get('mode','?')}]  idx={_c.get('idx','?')}  guardado: {_ts}"
+                            )
+                        _pick = safe_input(
+                            "\nChoose number (enter=cancel): "
+                            if LANG == "en"
+                            else "\nElige número (enter=cancelar): ",
+                            default="",
+                            on_interrupt="back",
+                        )
+                        if _pick and _pick.strip().isdigit():
+                            _num = int(_pick.strip()) - 1
+                            if 0 <= _num < len(_ckpts):
+                                ck = _ckpts[_num]
+                                _mode = ck.get("mode")
+                                if _mode == "ips":
+                                    run_ip_analysis_normal(
+                                        selected_fields_ips, api_keys, resume=ck
+                                    )
+                                elif _mode == "ips_tor":
+                                    run_ip_analysis_tor(
+                                        selected_fields_ips, api_keys, resume=ck
+                                    )
+                                elif _mode == "domains":
+                                    run_domains_export(api_keys, resume=ck)
+                                elif _mode == "files":
+                                    run_files_export(api_keys, resume=ck)
+                            else:
+                                print(
+                                    "Out of range.\n"
+                                    if LANG == "en"
+                                    else "Número fuera de rango.\n"
+                                )
+                        else:
+                            print("Cancelado.\n")
                 elif sub == "10" or sub.lower() in ("b", "q"):
                     print()
                     break
@@ -3831,19 +4068,11 @@ def main():
             # Exportar TODO: dominios y ficheros, con checkpoint
             run_domains_export(
                 api_keys,
-                resume=(
-                    load_ckpt()
-                    if load_ckpt() and load_ckpt().get("mode") == "domains"
-                    else None
-                ),
+                resume=load_ckpt(mode="domains"),
             )
             run_files_export(
                 api_keys,
-                resume=(
-                    load_ckpt()
-                    if load_ckpt() and load_ckpt().get("mode") == "files"
-                    else None
-                ),
+                resume=load_ckpt(mode="files"),
             )
 
         # -------------------  MENU DOMINIOS  ---------------------
@@ -3897,7 +4126,10 @@ def main():
                     run_domain_osint_lookup(list_file=path, resume=None)
 
                 elif sub == "3":
-                    ck = load_ckpt()
+                    _ckpts_dom = _list_available_ckpts(
+                        modes=["domains_list", "domains_osint"]
+                    )
+                    ck = _ckpts_dom[0] if _ckpts_dom else None
                     if not ck or ck.get("mode") not in (
                         "domains_list",
                         "domains_osint",
