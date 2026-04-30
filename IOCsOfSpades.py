@@ -1259,6 +1259,17 @@ def clear_ckpt(mode=None):
         pass
 
 
+def _list_available_ckpts(modes=None):
+    """Devuelve todos los checkpoints guardados, ordenados por timestamp desc.
+    Si modes se especifica, solo devuelve los que tengan un modo de esa lista."""
+    cks = _collect_ckpts()
+    if modes is not None:
+        wanted = set(modes)
+        cks = [c for c in cks if c.get("mode") in wanted]
+    cks.sort(key=lambda c: float(c.get("timestamp", 0) or 0), reverse=True)
+    return cks
+
+
 def refresh_osint_feeds_now():
     if LANG == "en":
         print("\n=== REFRESH OSINT FEEDS NOW ===")
@@ -5536,36 +5547,71 @@ def main():
                     if domains_ok:
                         run_files_export(api_keys)
                 elif sub == "9":
-                    ck = load_latest_ckpt(
-                        ["ips", "ips_tor", "ip_osint", "domains", "files"]
+                    import datetime as _dt_ckpt
+                    _ckpts = _list_available_ckpts(
+                        modes=["ips", "ips_tor", "ip_osint", "domains", "files"]
                     )
-                    if not ck or ck.get("mode") not in (
-                        "ips",
-                        "ips_tor",
-                        "ip_osint",
-                        "domains",
-                        "files",
-                    ):
+                    if not _ckpts:
                         if LANG == "en":
                             print("[CKPT] No checkpoint found.\n")
                         else:
                             print("[CKPT] No hay checkpoint.\n")
-                    else:
+                    elif len(_ckpts) == 1:
+                        ck = _ckpts[0]
                         mode = ck.get("mode")
                         if mode == "ips":
-                            run_ip_analysis_normal(
-                                selected_fields_ips, api_keys, resume=ck
-                            )
+                            run_ip_analysis_normal(selected_fields_ips, api_keys, resume=ck)
                         elif mode == "ips_tor":
-                            run_ip_analysis_tor(
-                                selected_fields_ips, api_keys, resume=ck
-                            )
+                            run_ip_analysis_tor(selected_fields_ips, api_keys, resume=ck)
                         elif mode == "ip_osint":
                             run_ip_osint_scan(resume=ck)
                         elif mode == "domains":
                             run_domains_export(api_keys, resume=ck)
                         elif mode == "files":
                             run_files_export(api_keys, resume=ck)
+                    else:
+                        print(
+                            "\n[CKPT] Multiple checkpoints found:"
+                            if LANG == "en"
+                            else "\n[CKPT] Hay varios checkpoints disponibles:"
+                        )
+                        for _n, _c in enumerate(_ckpts, 1):
+                            _ts = _dt_ckpt.datetime.fromtimestamp(
+                                float(_c.get("timestamp", 0))
+                            ).strftime("%Y-%m-%d %H:%M")
+                            print(
+                                f"  {_n}) [{_c.get('mode','?')}]  idx={_c.get('idx','?')}  saved: {_ts}"
+                                if LANG == "en"
+                                else f"  {_n}) [{_c.get('mode','?')}]  idx={_c.get('idx','?')}  guardado: {_ts}"
+                            )
+                        _pick = safe_input(
+                            "\nChoose number (enter=cancel): "
+                            if LANG == "en"
+                            else "\nElige número (enter=cancelar): ",
+                            default="",
+                            on_interrupt="back",
+                        )
+                        if _pick and _pick.strip().isdigit():
+                            _num = int(_pick.strip()) - 1
+                            if 0 <= _num < len(_ckpts):
+                                ck = _ckpts[_num]
+                                mode = ck.get("mode")
+                                if mode == "ips":
+                                    run_ip_analysis_normal(selected_fields_ips, api_keys, resume=ck)
+                                elif mode == "ips_tor":
+                                    run_ip_analysis_tor(selected_fields_ips, api_keys, resume=ck)
+                                elif mode == "ip_osint":
+                                    run_ip_osint_scan(resume=ck)
+                                elif mode == "domains":
+                                    run_domains_export(api_keys, resume=ck)
+                                elif mode == "files":
+                                    run_files_export(api_keys, resume=ck)
+                            else:
+                                print(
+                                    "Out of range.\n" if LANG == "en" else "Número fuera de rango.\n"
+                                )
+                        else:
+                            print("Cancelado.\n")
                 elif sub == "10" or sub.lower() in ("b", "q"):
                     print()
                     break
