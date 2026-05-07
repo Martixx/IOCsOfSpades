@@ -10,6 +10,7 @@ list_ip.txt
 list_domains.txt
 list_hashes.txt
 IOCS-apikeys.txt
+IPChecker-apikeys.txt
 
 # Legacy names (just in case)
 iplist.txt

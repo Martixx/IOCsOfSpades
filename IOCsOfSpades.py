@@ -23,6 +23,7 @@ def select_language():
 # -*- coding: utf-8 -*-
 import os
 import sys
+import subprocess
 import csv
 import json
 import time
@@ -2650,6 +2651,32 @@ def run_ip_analysis_tor(selected_fields, api_keys, resume=None):
         print("\n" + frase_epica_random() + "\n")
 
 
+def run_ipapi_script_standalone():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    script_path = os.path.join(base_dir, "ipapi_enrichment.py")
+
+    print(os.getcwd())
+    print(script_path)
+    print(os.path.abspath(os.path.join(base_dir, "list_ip.txt")))
+
+    if not os.path.exists(script_path):
+        print(
+            f"[!] Script not found: {script_path}"
+            if LANG == "en"
+            else f"[!] Script no encontrado: {script_path}"
+        )
+        return
+
+    try:
+        subprocess.run([sys.executable, script_path], cwd=base_dir, check=False)
+    except Exception as exc:
+        print(
+            f"[!] Error running ipapi_enrichment.py: {exc}"
+            if LANG == "en"
+            else f"[!] Error ejecutando ipapi_enrichment.py: {exc}"
+        )
+
+
 # === Fechas
 FILL_LAST_RESOLVED_WITH_FIRST = True
 
@@ -3611,8 +3638,9 @@ def ip_menu(fast_flag: bool, ssl_status: str):
         print("7) Export FILES (from the most recent DOMAINS.csv)")
         print("8) Export EVERYTHING (domains by IP + files)")
         print("9) Resume (IPs / DOMAINS / FILES)")
-        print("10) Back")
-        return input("\nChoose an option: ").strip()
+        print("10) IP-API enrichment")
+        print("11) Back")
+        return safe_input("\nChoose an option: ", default="11", on_interrupt="default")
     else:
         print(f"\n=== MENÚ IPs  [SSL: {ssl_status.upper()}] ===")
         print("1) Analizar IPs en VirusTotal (VT)")
@@ -3624,8 +3652,11 @@ def ip_menu(fast_flag: bool, ssl_status: str):
         print("7) Exportar FICHEROS (desde el DOMAINS.csv más reciente)")
         print("8) Exportar TODO (dominios por IP + ficheros)")
         print("9) Reanudar (IPs / DOMAINS / FILES)")
-        print("10) Volver")
-        return input("\nSelecciona una opción: ").strip()
+        print("10) IP-API enrichment")
+        print("11) Volver")
+        return safe_input(
+            "\nSelecciona una opción: ", default="11", on_interrupt="default"
+        )
 
 
 def domain_menu(ssl_status: str):
@@ -4040,7 +4071,9 @@ def main():
                                 )
                         else:
                             print("Cancelado.\n")
-                elif sub == "10" or sub.lower() in ("b", "q"):
+                elif sub == "10":
+                    run_ipapi_script_standalone()
+                elif sub == "11" or sub.lower() in ("b", "q"):
                     print()
                     break
                 else:
