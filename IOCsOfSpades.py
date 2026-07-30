@@ -4,15 +4,13 @@ LANG = "en"  # por defecto
 
 def select_language():
     global LANG
-    print(
-        """
+    print("""
 =======================================
   Selecciona idioma / Choose language
 =======================================
 1) Español
 2) English
-"""
-    )
+""")
     opt = input("Opción / Option [1/2]: ").strip()
     if opt == "2":
         LANG = "en"
@@ -41,7 +39,6 @@ import gzip
 import bisect
 import pickle
 import shutil
-
 
 # === IOCs of Spades — MOTÖRHEAD EDITION ======================================
 APP_NAME = "IOCs of Spades"
@@ -625,6 +622,25 @@ def ip2asn_lookup(ip: str):
     return None
 
 
+def extract_asn_number(raw_value) -> int | None:
+    if isinstance(raw_value, int):
+        return raw_value if raw_value > 0 else None
+    if not raw_value:
+        return None
+    text = str(raw_value).strip()
+    if not text:
+        return None
+    match = re.search(r"\bAS\s*([0-9]+)\b|\b([0-9]+)\b", text, flags=re.I)
+    if not match:
+        return None
+    digits = match.group(1) or match.group(2)
+    try:
+        asn = int(digits)
+        return asn if asn > 0 else None
+    except Exception:
+        return None
+
+
 def _get_int_env(name: str, default_val: int) -> int:
     try:
         raw = os.getenv(name, "")
@@ -781,18 +797,50 @@ def read_lines(path):
         return [x.strip() for x in f if x.strip()]
 
 
+def load_api_keys(path=API_KEYS_FILE):
+    """
+    Lee IOCS-apikeys.txt con formato CLAVE=valor (una por linea).
+    Claves reconocidas: VT, ABUSEIPDB, ABUSECH, OTX.
+    Para ABUSEIPDB/ABUSECH/OTX se permiten multiples claves por linea
+    separadas por coma/espacio/punto y coma, o repitiendo la misma clave.
+    Retrocompatible: linea sin '=' se trata como VT key.
+    """
+    keys = {"VT": [], "ABUSEIPDB": [], "ABUSECH": [], "OTX": []}
+    if not os.path.exists(path):
+        return keys
+    for line in read_lines(path):
+        if line.startswith("#"):
+            continue
+        if "=" in line:
+            prefix, _, value = line.partition("=")
+            prefix = prefix.strip().upper()
+            value = value.strip()
+            if prefix == "VT" and value:
+                keys["VT"].extend(parse_key_pool(value))
+            elif prefix == "ABUSEIPDB" and value:
+                keys["ABUSEIPDB"].extend(parse_key_pool(value))
+            elif prefix == "ABUSECH" and value:
+                keys["ABUSECH"].extend(parse_key_pool(value))
+            elif prefix == "OTX" and value:
+                keys["OTX"].extend(parse_key_pool(value))
+        else:
+            if line:
+                keys["VT"].extend(parse_key_pool(line))
+    return keys
+
+
 # Checkpoint por modo: cada tipo de proceso usa su propio fichero para evitar
 # que procesos paralelos (IPs, DOMAINS, FILES…) se sobreescriban entre sí.
 _CKPT_BY_MODE: dict[str, str] = {
-    "ips":           ".iocs_ckpt_ips.json",
-    "ips_tor":       ".iocs_ckpt_ips.json",
-    "ip_osint":      ".iocs_ckpt_ips.json",
-    "domains":       ".iocs_ckpt_domains.json",
+    "ips": ".iocs_ckpt_ips.json",
+    "ips_tor": ".iocs_ckpt_ips.json",
+    "ip_osint": ".iocs_ckpt_ips.json",
+    "domains": ".iocs_ckpt_domains.json",
     "domains_osint": ".iocs_ckpt_domains.json",
-    "domains_list":  ".iocs_ckpt_domains.json",
-    "files":         ".iocs_ckpt_files.json",
-    "hash_list":     ".iocs_ckpt_hash.json",
-    "hash_osint":    ".iocs_ckpt_hash.json",
+    "domains_list": ".iocs_ckpt_domains.json",
+    "files": ".iocs_ckpt_files.json",
+    "hash_list": ".iocs_ckpt_hash.json",
+    "hash_osint": ".iocs_ckpt_hash.json",
 }
 _ALL_CKPT_FILES: list[str] = list(dict.fromkeys(_CKPT_BY_MODE.values())) + [CKPT_FILE]
 
@@ -884,6 +932,40 @@ def parse_key_pool(raw_value: str) -> list:
         seen.add(key)
         out.append(key)
     return out
+
+
+def _iter_api_key_file_candidates():
+    seen = set()
+    for cand in (
+        API_KEYS_FILE,
+        "IPChecker-apikeys.txt",
+        os.path.join("..", "IPChecker-apikeys.txt"),
+    ):
+        norm = os.path.normpath(cand)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        yield norm
+
+
+def load_named_api_key_value(name: str) -> str:
+    wanted = str(name or "").strip().upper()
+    if not wanted:
+        return ""
+    for path in _iter_api_key_file_candidates():
+        if not os.path.exists(path):
+            continue
+        try:
+            for raw_line in read_lines(path):
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key_name, value = line.split("=", 1)
+                if key_name.strip().upper() == wanted and value.strip():
+                    return value.strip()
+        except Exception:
+            continue
+    return ""
 
 
 def rotating_lookup(key_pool, idx_ptr, fn_lookup, status_field, rotate_statuses):
@@ -1043,6 +1125,33 @@ def vt_get_ip(ip, key):
     headers = {"accept": "application/json", "x-apikey": key}
     timeout = 12 if FAST_PROFILE else 25
     return requests.get(url, headers=headers, timeout=timeout)
+
+
+def vt_get_ip_rotating_keys(ip, api_keys, idx_ptr, rotate_statuses=None):
+    if not api_keys:
+        return None, idx_ptr, False
+
+    if rotate_statuses is None:
+        rotate_statuses = {401, 403, 429, 503, 504}
+
+    n = len(api_keys)
+    last_resp = None
+    exhausted = True
+    for _ in range(n):
+        key = api_keys[idx_ptr % n]
+        idx_ptr += 1
+        r = vt_get_ip(ip, key)
+        if r is None:
+            continue
+        last_resp = r
+        if r.status_code == 200:
+            return r, idx_ptr, False
+        if r.status_code in rotate_statuses:
+            continue
+        exhausted = False
+        return r, idx_ptr, False
+
+    return last_resp, idx_ptr, exhausted
 
 
 def vt_fetch_ip_resolutions(
@@ -1474,11 +1583,18 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
     osint_toggles = globals().get("OSINT_IP_SOURCES", OSINT_IP_SOURCES)
 
     # 2.5) API keys para fuentes nuevas
-    abuseipdb_keys = parse_key_pool(os.getenv("ABUSEIPDB_API_KEY") or "")
-    abusech_keys = parse_key_pool(
-        os.getenv("ABUSECH_AUTH_KEY") or os.getenv("MBZ_AUTH_KEY") or ""
+    abuseipdb_keys = parse_key_pool(
+        os.getenv("ABUSEIPDB_API_KEY") or load_named_api_key_value("ABUSEIPDB")
     )
-    otx_keys = parse_key_pool(os.getenv("OTX_API_KEY") or "")
+    abusech_keys = parse_key_pool(
+        os.getenv("ABUSECH_AUTH_KEY")
+        or os.getenv("MBZ_AUTH_KEY")
+        or load_named_api_key_value("ABUSECH")
+        or load_named_api_key_value("MBZ")
+    )
+    otx_keys = parse_key_pool(
+        os.getenv("OTX_API_KEY") or load_named_api_key_value("OTX")
+    )
 
     abuseipdb_key = abuseipdb_keys[0] if abuseipdb_keys else ""
     abusech_key = abusech_keys[0] if abusech_keys else ""
@@ -1586,6 +1702,9 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
     fields = [
         "ip",
         "verdict",
+        "verdict_reason",
+        "asn_resolved",
+        "asn_resolved_source",
         "asn_drop",
         "asn_drop_source",
         "bl_dshield_24",
@@ -1636,7 +1755,59 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
         if (resume and resume.get("mode") == "ip_osint")
         else 0
     )
+    ckpt_out_csv = (
+        str(resume.get("out_csv", "")).strip()
+        if (resume and resume.get("mode") == "ip_osint")
+        else ""
+    )
+    if start_i > 0 and ckpt_out_csv:
+        out_csv = ckpt_out_csv
     mode = "a" if start_i > 0 else "w"
+
+    if start_i > 0:
+        if not os.path.exists(out_csv):
+            start_i = 0
+            mode = "w"
+        else:
+            try:
+                with open(out_csv, "r", encoding="utf-8", newline="") as header_fh:
+                    existing_header = next(csv.reader(header_fh), [])
+                if existing_header != fields:
+                    print(
+                        f"[OSINT] Existing output {out_csv} has an old header. Restarting full export."
+                        if LANG == "en"
+                        else f"[OSINT] La salida existente {out_csv} tiene cabecera antigua. Reiniciando export completo."
+                    )
+                    legacy_out_csv = out_csv.replace(
+                        ".csv",
+                        f"_legacy_header_{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv",
+                    )
+                    try:
+                        os.replace(out_csv, legacy_out_csv)
+                        print(
+                            f"[OSINT] Preserved previous output as {legacy_out_csv}."
+                            if LANG == "en"
+                            else f"[OSINT] Salida previa conservada como {legacy_out_csv}."
+                        )
+                    except Exception:
+                        pass
+                    start_i = 0
+                    mode = "w"
+            except Exception:
+                start_i = 0
+                mode = "w"
+
+    print(
+        f"[OSINT] Output file: {out_csv}"
+        if LANG == "en"
+        else f"[OSINT] Fichero de salida: {out_csv}"
+    )
+    if start_i > 0:
+        print(
+            f"[OSINT] Resuming from row {start_i + 1}."
+            if LANG == "en"
+            else f"[OSINT] Reanudando desde la fila {start_i + 1}."
+        )
 
     # Contadores de resumen
     hits_any = 0
@@ -1675,6 +1846,8 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
 
                 row = {
                     "ip": ip,
+                    "asn_resolved": "",
+                    "asn_resolved_source": "",
                     "asn_drop": "",
                     "asn_drop_source": "",
                     "bl_dshield_24": "no",
@@ -1711,14 +1884,22 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                         time.sleep(wait_s)
 
                 now = time.time()
-                if use_abuseipdb and abuseipdb_pool_exhausted and now >= abuseipdb_retry_at:
+                if (
+                    use_abuseipdb
+                    and abuseipdb_pool_exhausted
+                    and now >= abuseipdb_retry_at
+                ):
                     abuseipdb_pool_exhausted = False
                     print(
                         "[OSINT] ↻ Retrying AbuseIPDB after cooldown."
                         if LANG == "en"
                         else "[OSINT] ↻ Reintentando AbuseIPDB tras cooldown."
                     )
-                if use_threatfox and threatfox_pool_exhausted and now >= threatfox_retry_at:
+                if (
+                    use_threatfox
+                    and threatfox_pool_exhausted
+                    and now >= threatfox_retry_at
+                ):
                     threatfox_pool_exhausted = False
                     print(
                         "[OSINT] ↻ Retrying ThreatFox after cooldown."
@@ -1772,10 +1953,16 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                     # 1) VT (si existe *_ULTRA.csv con mapa ip→asn)
                     if ip2asn_map:
                         asn_num = ip2asn_map.get(ip)
+                        if isinstance(asn_num, int):
+                            row["asn_resolved"] = str(asn_num)
+                            row["asn_resolved_source"] = "vt_ultra_csv"
 
                     # 2) IPtoASN (índice local, sin VT)
                     if asn_num is None and ip2asn_ready:
                         asn_num = ip2asn_lookup(ip)
+                        if isinstance(asn_num, int):
+                            row["asn_resolved"] = str(asn_num)
+                            row["asn_resolved_source"] = "iptoasn_local"
 
                     if isinstance(asn_num, int):
                         if asn_num in asn_drop:
@@ -1835,13 +2022,18 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                     time.sleep(0.2)
 
                 if use_urlhaus and not urlhaus_pool_exhausted:
-                    uh, idx_urlhaus, urlhaus_pool_exhausted = rotating_lookup(
-                        abusech_keys,
-                        idx_urlhaus,
-                        lambda key: urlhaus_host_lookup(ip, key),
-                        "urlhaus_status",
-                        {"rate_limited", "forbidden", "http429", "http403"},
-                    )
+                    if abusech_keys:
+                        uh, idx_urlhaus, urlhaus_pool_exhausted = rotating_lookup(
+                            abusech_keys,
+                            idx_urlhaus,
+                            lambda key: urlhaus_host_lookup(ip, key),
+                            "urlhaus_status",
+                            {"rate_limited", "forbidden", "http429", "http403"},
+                        )
+                    else:
+                        uh = urlhaus_host_lookup(ip)
+                        idx_urlhaus = idx_urlhaus
+                        urlhaus_pool_exhausted = False
                     row.update(uh)
                     if urlhaus_pool_exhausted:
                         urlhaus_retry_at = time.time() + api_cooldown_s
@@ -1850,7 +2042,10 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                             if LANG == "en"
                             else f"\n[OSINT] ⚠ Pool de claves URLhaus agotado (límite/bloqueo) — cooldown {api_cooldown_s}s."
                         )
-                    if uh.get("urlhaus_status") == "ok" and uh.get("urlhaus_url_count", "0") != "0":
+                    if (
+                        uh.get("urlhaus_status") == "ok"
+                        and uh.get("urlhaus_url_count", "0") != "0"
+                    ):
                         hits_urlhaus += 1
                     time.sleep(0.2)
 
@@ -1870,9 +2065,22 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                             if LANG == "en"
                             else f"\n[OSINT] ⚠ Pool de claves OTX agotado (límite/bloqueo) — cooldown {api_cooldown_s}s."
                         )
-                    if otx.get("otx_status") == "ok" and otx.get("otx_pulses", "0") != "0":
+                    if (
+                        otx.get("otx_status") == "ok"
+                        and otx.get("otx_pulses", "0") != "0"
+                    ):
                         hits_otx += 1
                     time.sleep(0.2)
+
+                if asn_drop and row.get("asn_drop", "") == "":
+                    otx_asn_num = extract_asn_number(row.get("otx_asn", ""))
+                    if isinstance(otx_asn_num, int):
+                        row["asn_resolved"] = str(otx_asn_num)
+                        row["asn_resolved_source"] = "alienvault_otx"
+                        row["asn_drop"] = "yes" if otx_asn_num in asn_drop else "no"
+                        row["asn_drop_source"] = "alienvault_otx"
+                        if row["asn_drop"] == "yes":
+                            hits_asn += 1
 
                 # ¿Alguna señal?
                 if (
@@ -1882,12 +2090,45 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                     or row["bl_cinsscore"] == "yes"
                     or row["bl_et_compromised"] == "yes"
                     or row["asn_drop"] == "yes"
-                    or (row.get("abuseipdb_score") and row["abuseipdb_score"] not in ("", "0"))
+                    or (
+                        row.get("abuseipdb_score")
+                        and row["abuseipdb_score"] not in ("", "0")
+                    )
                     or row.get("threatfox_status") == "ok"
-                    or (row.get("urlhaus_status") == "ok" and row.get("urlhaus_url_count", "0") != "0")
-                    or (row.get("otx_status") == "ok" and row.get("otx_pulses", "0") != "0")
+                    or (
+                        row.get("urlhaus_status") == "ok"
+                        and row.get("urlhaus_url_count", "0") != "0"
+                    )
+                    or (
+                        row.get("otx_status") == "ok"
+                        and row.get("otx_pulses", "0") != "0"
+                    )
                 ):
                     hits_any += 1
+
+                mal_reasons = []
+                if row["asn_drop"] == "yes":
+                    mal_reasons.append("asn_drop")
+                if row["bl_blocklistde_48h"] == "yes":
+                    mal_reasons.append("blocklistde")
+                if row["bl_feodo"] == "yes":
+                    mal_reasons.append("feodo")
+                if row["bl_cinsscore"] == "yes":
+                    mal_reasons.append("cinsscore")
+                if row["bl_et_compromised"] == "yes":
+                    mal_reasons.append("et_compromised")
+                if row.get("threatfox_status") == "ok":
+                    mal_reasons.append("threatfox")
+                if row.get("urlhaus_status") == "ok" and row.get(
+                    "urlhaus_url_count", "0"
+                ) not in ("", "0"):
+                    mal_reasons.append("urlhaus")
+                if (
+                    row.get("abuseipdb_score")
+                    and row["abuseipdb_score"].isdigit()
+                    and int(row["abuseipdb_score"]) >= 75
+                ):
+                    mal_reasons.append("abuseipdb>=75")
 
                 _mal = (
                     row["asn_drop"] == "yes"
@@ -1896,13 +2137,34 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                     or row["bl_cinsscore"] == "yes"
                     or row["bl_et_compromised"] == "yes"
                     or row.get("threatfox_status") == "ok"
-                    or (row.get("urlhaus_status") == "ok" and row.get("urlhaus_url_count", "0") not in ("", "0"))
+                    or (
+                        row.get("urlhaus_status") == "ok"
+                        and row.get("urlhaus_url_count", "0") not in ("", "0")
+                    )
                     or (
                         row.get("abuseipdb_score")
                         and row["abuseipdb_score"].isdigit()
                         and int(row["abuseipdb_score"]) >= 75
                     )
                 )
+                sus_reasons = []
+                if row["bl_dshield_24"] == "yes":
+                    sus_reasons.append("dshield")
+                if (
+                    row.get("abuseipdb_score")
+                    and row["abuseipdb_score"].isdigit()
+                    and int(row["abuseipdb_score"]) >= 25
+                ):
+                    sus_reasons.append("abuseipdb>=25")
+                if (
+                    row.get("otx_pulses")
+                    and row["otx_pulses"].isdigit()
+                    and int(row["otx_pulses"]) >= 5
+                ):
+                    sus_reasons.append("otx_pulses>=5")
+                if row.get("abuseipdb_is_tor") == "true":
+                    sus_reasons.append("abuseipdb_tor")
+
                 _sus = not _mal and (
                     row["bl_dshield_24"] == "yes"
                     or (
@@ -1917,10 +2179,22 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                     )
                     or row.get("abuseipdb_is_tor") == "true"
                 )
-                row["verdict"] = "malicious" if _mal else "suspicious" if _sus else "clean"
+                row["verdict"] = (
+                    "malicious" if _mal else "suspicious" if _sus else "clean"
+                )
+                row["verdict_reason"] = "|".join(
+                    mal_reasons if _mal else sus_reasons if _sus else ["none"]
+                )
 
                 w.writerow(row)
-                save_ckpt({"mode": "ip_osint", "idx": i + 1, "timestamp": time.time()})
+                save_ckpt(
+                    {
+                        "mode": "ip_osint",
+                        "idx": i + 1,
+                        "timestamp": time.time(),
+                        "out_csv": out_csv,
+                    }
+                )
 
         except KeyboardInterrupt:
             if LANG == "en":
@@ -1987,31 +2261,39 @@ def abuseipdb_check(ip: str, api_key: str) -> dict:
         empty["abuseipdb_status"] = "no_key"
         return empty
     try:
-        headers = {"Key": api_key, "Accept": "application/json"}
-        params = {"ipAddress": ip, "maxAgeInDays": "90"}
-        r = requests.get(ABUSEIPDB_API_URL, headers=headers, params=params, timeout=20)
-        if r.status_code == 429:
-            return {**empty, "abuseipdb_status": "rate_limited"}
-        if r.status_code != 200:
-            return {**empty, "abuseipdb_status": f"HTTP{r.status_code}"}
-        j = r.json()
-        data = j.get("data", {})
-        return {
-            "abuseipdb_score": str(data.get("abuseConfidenceScore", "")),
-            "abuseipdb_reports": str(data.get("totalReports", "")),
-            "abuseipdb_usage": data.get("usageType", "") or "",
-            "abuseipdb_isp": data.get("isp", "") or "",
-            "abuseipdb_country": data.get("countryCode", "") or "",
-            "abuseipdb_is_tor": str(data.get("isTor", "")).lower(),
-            "abuseipdb_last_report": data.get("lastReportedAt", "") or "",
-            "abuseipdb_status": "ok",
-        }
-    except Exception as e:
-        return {**empty, "abuseipdb_status": f"ERROR:{e}"}
+        r = requests.get(
+            ABUSEIPDB_API_URL,
+            headers={"Key": api_key, "Accept": "application/json"},
+            params={"ipAddress": ip, "maxAgeInDays": "90", "verbose": ""},
+            timeout=30,
+        )
+        if r.status_code == 200:
+            data = (r.json() or {}).get("data", {})
+            empty.update(
+                {
+                    "abuseipdb_score": str(data.get("abuseConfidenceScore", "") or ""),
+                    "abuseipdb_reports": str(data.get("totalReports", "") or ""),
+                    "abuseipdb_usage": str(data.get("usageType", "") or ""),
+                    "abuseipdb_isp": str(data.get("isp", "") or ""),
+                    "abuseipdb_country": str(data.get("countryCode", "") or ""),
+                    "abuseipdb_is_tor": str(bool(data.get("isTor", False))).lower(),
+                    "abuseipdb_last_report": str(data.get("lastReportedAt", "") or ""),
+                    "abuseipdb_status": "ok",
+                }
+            )
+        elif r.status_code in (401, 403):
+            empty["abuseipdb_status"] = "forbidden"
+        elif r.status_code == 429:
+            empty["abuseipdb_status"] = "rate_limited"
+        else:
+            empty["abuseipdb_status"] = f"http{r.status_code}"
+    except Exception:
+        empty["abuseipdb_status"] = "error"
+    return empty
 
 
-# === ThreatFox lookup (IPs/domains) — abuse.ch ================================
-def threatfox_search_ioc(ioc: str, auth_key: str) -> dict:
+# === ThreatFox lookup (IPs / hashes) =========================================
+def threatfox_search_ioc(ioc: str, auth_key: str = "") -> dict:
     empty = {
         "threatfox_malware": "",
         "threatfox_threat_type": "",
@@ -2020,72 +2302,49 @@ def threatfox_search_ioc(ioc: str, auth_key: str) -> dict:
         "threatfox_first_seen": "",
         "threatfox_status": "",
     }
-    if not auth_key:
-        empty["threatfox_status"] = "no_key"
-        return empty
     try:
-        headers = {"Auth-Key": auth_key}
-        payload = json.dumps(
-            {"query": "search_ioc", "search_term": ioc, "exact_match": True}
-        )
-        r = requests.post(THREATFOX_API_URL, headers=headers, data=payload, timeout=25)
-        if r.status_code != 200:
-            return {**empty, "threatfox_status": f"HTTP{r.status_code}"}
-        j = r.json()
-        qstatus = (j.get("query_status") or "").lower()
-        if qstatus == "no_result" or not j.get("data"):
-            return {**empty, "threatfox_status": "not_found"}
-        hit = j["data"][0]
-        return {
-            "threatfox_malware": hit.get("malware_printable", "") or "",
-            "threatfox_threat_type": hit.get("threat_type", "") or "",
-            "threatfox_confidence": str(hit.get("confidence_level", "")),
-            "threatfox_tags": ",".join(hit.get("tags") or []),
-            "threatfox_first_seen": hit.get("first_seen", "") or "",
-            "threatfox_status": "ok",
-        }
-    except Exception as e:
-        return {**empty, "threatfox_status": f"ERROR:{e}"}
+        headers = {"Content-Type": "application/json"}
+        if auth_key:
+            headers["Auth-Key"] = auth_key
+        payload = {"query": "search_ioc", "search_term": ioc}
+        r = requests.post(THREATFOX_API_URL, json=payload, headers=headers, timeout=30)
+        if r.status_code == 200:
+            j = r.json() or {}
+            if j.get("query_status") == "ok" and j.get("data"):
+                item = j["data"][0]
+                empty.update(
+                    {
+                        "threatfox_malware": str(
+                            item.get("malware_printable", "") or ""
+                        ),
+                        "threatfox_threat_type": str(item.get("threat_type", "") or ""),
+                        "threatfox_confidence": str(
+                            item.get("confidence_level", "") or ""
+                        ),
+                        "threatfox_tags": ",".join(item.get("tags") or []),
+                        "threatfox_first_seen": str(item.get("first_seen", "") or ""),
+                        "threatfox_status": "ok",
+                    }
+                )
+            else:
+                empty["threatfox_status"] = j.get("query_status", "no_result")
+        elif r.status_code in (401, 403):
+            empty["threatfox_status"] = "forbidden"
+        elif r.status_code == 429:
+            empty["threatfox_status"] = "rate_limited"
+        else:
+            empty["threatfox_status"] = f"http{r.status_code}"
+    except Exception:
+        empty["threatfox_status"] = "error"
+    return empty
 
 
-# === ThreatFox hash lookup — abuse.ch =========================================
-def threatfox_search_hash(hash_val: str, auth_key: str) -> dict:
-    empty = {
-        "threatfox_malware": "",
-        "threatfox_threat_type": "",
-        "threatfox_confidence": "",
-        "threatfox_tags": "",
-        "threatfox_ioc": "",
-        "threatfox_status": "",
-    }
-    if not auth_key:
-        empty["threatfox_status"] = "no_key"
-        return empty
-    try:
-        headers = {"Auth-Key": auth_key}
-        payload = json.dumps({"query": "search_hash", "hash": hash_val})
-        r = requests.post(THREATFOX_API_URL, headers=headers, data=payload, timeout=25)
-        if r.status_code != 200:
-            return {**empty, "threatfox_status": f"HTTP{r.status_code}"}
-        j = r.json()
-        qstatus = (j.get("query_status") or "").lower()
-        if qstatus == "no_result" or not j.get("data"):
-            return {**empty, "threatfox_status": "not_found"}
-        hit = j["data"][0]
-        return {
-            "threatfox_malware": hit.get("malware_printable", "") or "",
-            "threatfox_threat_type": hit.get("threat_type", "") or "",
-            "threatfox_confidence": str(hit.get("confidence_level", "")),
-            "threatfox_tags": ",".join(hit.get("tags") or []),
-            "threatfox_ioc": hit.get("ioc", "") or "",
-            "threatfox_status": "ok",
-        }
-    except Exception as e:
-        return {**empty, "threatfox_status": f"ERROR:{e}"}
+def threatfox_search_hash(file_hash: str, auth_key: str = "") -> dict:
+    return threatfox_search_ioc(file_hash, auth_key)
 
 
-# === URLhaus host lookup (IPs/domains) — abuse.ch =============================
-def urlhaus_host_lookup(host: str, auth_key: str) -> dict:
+# === URLhaus lookup (host / payload) ==========================================
+def urlhaus_host_lookup(host: str, auth_key: str = "") -> dict:
     empty = {
         "urlhaus_url_count": "",
         "urlhaus_spamhaus_dbl": "",
@@ -2094,65 +2353,82 @@ def urlhaus_host_lookup(host: str, auth_key: str) -> dict:
         "urlhaus_status": "",
     }
     try:
-        headers = {"Auth-Key": auth_key} if auth_key else {}
-        data = {"host": host}
+        headers = {}
+        if auth_key:
+            headers["Auth-Key"] = auth_key
         r = requests.post(
-            URLHAUS_API_URL + "host/", headers=headers, data=data, timeout=25
+            URLHAUS_API_URL + "host/",
+            data={"host": host},
+            headers=headers,
+            timeout=30,
         )
-        if r.status_code != 200:
-            return {**empty, "urlhaus_status": f"HTTP{r.status_code}"}
-        j = r.json()
-        qstatus = (j.get("query_status") or j.get("query_staus") or "").lower()
-        if qstatus in ("no_results", "invalid_host"):
-            return {**empty, "urlhaus_status": "not_found"}
-        bls = j.get("blacklists") or {}
-        return {
-            "urlhaus_url_count": str(j.get("url_count", "") or ""),
-            "urlhaus_spamhaus_dbl": bls.get("spamhaus_dbl", "") or "",
-            "urlhaus_surbl": bls.get("surbl", "") or "",
-            "urlhaus_firstseen": j.get("firstseen", "") or "",
-            "urlhaus_status": "ok",
-        }
-    except Exception as e:
-        return {**empty, "urlhaus_status": f"ERROR:{e}"}
+        if r.status_code == 200:
+            j = r.json() or {}
+            if j.get("query_status") == "ok":
+                empty.update(
+                    {
+                        "urlhaus_url_count": str(j.get("url_count", "") or ""),
+                        "urlhaus_spamhaus_dbl": str(j.get("spamhaus_dbl", "") or ""),
+                        "urlhaus_surbl": str(j.get("surbl", "") or ""),
+                        "urlhaus_firstseen": str(j.get("firstseen", "") or ""),
+                        "urlhaus_status": "ok",
+                    }
+                )
+            else:
+                empty["urlhaus_status"] = j.get("query_status", "no_result")
+        elif r.status_code in (401, 403):
+            empty["urlhaus_status"] = "forbidden"
+        elif r.status_code == 429:
+            empty["urlhaus_status"] = "rate_limited"
+        else:
+            empty["urlhaus_status"] = f"http{r.status_code}"
+    except Exception:
+        empty["urlhaus_status"] = "error"
+    return empty
 
 
-# === URLhaus payload lookup (hashes) — abuse.ch ===============================
-def urlhaus_payload_lookup(hash_val: str, auth_key: str) -> dict:
+def urlhaus_payload_lookup(file_hash: str, auth_key: str = "") -> dict:
     empty = {
+        "urlhaus_payload_status": "",
         "urlhaus_signature": "",
-        "urlhaus_file_type": "",
+        "urlhaus_filename": "",
         "urlhaus_firstseen": "",
-        "urlhaus_url_count": "",
-        "urlhaus_status": "",
     }
     try:
-        headers = {"Auth-Key": auth_key} if auth_key else {}
-        if len(hash_val) == 32:
-            data = {"md5_hash": hash_val}
-        else:
-            data = {"sha256_hash": hash_val}
+        headers = {}
+        if auth_key:
+            headers["Auth-Key"] = auth_key
         r = requests.post(
-            URLHAUS_API_URL + "payload/", headers=headers, data=data, timeout=25
+            URLHAUS_API_URL + "payload/",
+            data={"sha256_hash": file_hash},
+            headers=headers,
+            timeout=30,
         )
-        if r.status_code != 200:
-            return {**empty, "urlhaus_status": f"HTTP{r.status_code}"}
-        j = r.json()
-        qstatus = (j.get("query_status") or "").lower()
-        if qstatus in ("no_results", "invalid_md5", "invalid_sha256"):
-            return {**empty, "urlhaus_status": qstatus}
-        return {
-            "urlhaus_signature": j.get("signature") or "",
-            "urlhaus_file_type": j.get("file_type") or "",
-            "urlhaus_firstseen": j.get("firstseen") or "",
-            "urlhaus_url_count": str(j.get("url_count", "") or ""),
-            "urlhaus_status": "ok",
-        }
-    except Exception as e:
-        return {**empty, "urlhaus_status": f"ERROR:{e}"}
+        if r.status_code == 200:
+            j = r.json() or {}
+            if j.get("query_status") == "ok":
+                empty.update(
+                    {
+                        "urlhaus_payload_status": "ok",
+                        "urlhaus_signature": str(j.get("signature", "") or ""),
+                        "urlhaus_filename": str(j.get("filename", "") or ""),
+                        "urlhaus_firstseen": str(j.get("firstseen", "") or ""),
+                    }
+                )
+            else:
+                empty["urlhaus_payload_status"] = j.get("query_status", "no_result")
+        elif r.status_code in (401, 403):
+            empty["urlhaus_payload_status"] = "forbidden"
+        elif r.status_code == 429:
+            empty["urlhaus_payload_status"] = "rate_limited"
+        else:
+            empty["urlhaus_payload_status"] = f"http{r.status_code}"
+    except Exception:
+        empty["urlhaus_payload_status"] = "error"
+    return empty
 
 
-# === OTX AlienVault lookup functions ==========================================
+# === OTX AlienVault lookup (IP) ===============================================
 def otx_ip_lookup(ip: str, api_key: str) -> dict:
     empty = {
         "otx_pulses": "",
@@ -2165,32 +2441,32 @@ def otx_ip_lookup(ip: str, api_key: str) -> dict:
         empty["otx_status"] = "no_key"
         return empty
     try:
-        headers = {"X-OTX-API-KEY": api_key, "Accept": "application/json"}
         r = requests.get(
             f"{OTX_API_URL}/IPv4/{ip}/general",
-            headers=headers,
-            timeout=20,
+            headers={"X-OTX-API-KEY": api_key},
+            timeout=30,
         )
-        if r.status_code == 429:
-            return {**empty, "otx_status": "rate_limited"}
-        if r.status_code == 403:
-            return {**empty, "otx_status": "forbidden"}
-        if r.status_code != 200:
-            return {**empty, "otx_status": f"HTTP{r.status_code}"}
-        j = r.json()
-        pulse_count = j.get("pulse_info", {}).get("count", 0)
-        reputation = j.get("reputation", "")
-        country = j.get("country_name", "") or ""
-        asn = j.get("asn", "") or ""
-        return {
-            "otx_pulses": str(pulse_count),
-            "otx_reputation": str(reputation) if reputation else "",
-            "otx_country": country,
-            "otx_asn": asn,
-            "otx_status": "ok",
-        }
-    except Exception as e:
-        return {**empty, "otx_status": f"ERROR:{e}"}
+        if r.status_code == 200:
+            j = r.json() or {}
+            pulse_info = j.get("pulse_info") or {}
+            empty.update(
+                {
+                    "otx_pulses": str(pulse_info.get("count", "") or ""),
+                    "otx_reputation": str(j.get("reputation", "") or ""),
+                    "otx_country": str(j.get("country_code", "") or ""),
+                    "otx_asn": str(j.get("asn", "") or ""),
+                    "otx_status": "ok",
+                }
+            )
+        elif r.status_code in (401, 403):
+            empty["otx_status"] = "forbidden"
+        elif r.status_code == 429:
+            empty["otx_status"] = "rate_limited"
+        else:
+            empty["otx_status"] = f"http{r.status_code}"
+    except Exception:
+        empty["otx_status"] = "error"
+    return empty
 
 
 def load_openphish_hosts():
@@ -2960,7 +3236,10 @@ def _build_canonical_ip_fields(row):
     tags = []
     if "phish" in text_hints or "credential" in text_hints:
         tags.append("phishing")
-    if any(k in text_hints for k in ["malware", "trojan", "stealer", "ransom", "virus", "worm"]):
+    if any(
+        k in text_hints
+        for k in ["malware", "trojan", "stealer", "ransom", "virus", "worm"]
+    ):
         tags.append("malware")
     if c2_yes or any(k in text_hints for k in ["c2", "command and control", "beacon"]):
         tags.append("c2")
@@ -2978,7 +3257,16 @@ def _build_canonical_ip_fields(row):
     if malicious > 0 and "malware" not in tags:
         tags.append("malware")
 
-    priority = ["phishing", "malware", "c2", "botnet", "scanner", "adware", "proxy", "spam"]
+    priority = [
+        "phishing",
+        "malware",
+        "c2",
+        "botnet",
+        "scanner",
+        "adware",
+        "proxy",
+        "spam",
+    ]
     ordered_tags = [t for t in priority if t in tags]
     for t in tags:
         if t not in ordered_tags:
@@ -3050,9 +3338,11 @@ def run_ip_analysis_normal(selected_fields, api_keys, resume=None):
         print("Ctrl+C → guarda checkpoint y termina. Reanuda desde IP > 8).")
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
     _rpm_str = safe_input(
-        "VT requests per minute [default 4, higher=faster]: "
-        if LANG == "en"
-        else "Peticiones VT por minuto (VT) [por defecto 4, más alto=más rápido]: ",
+        (
+            "VT requests per minute [default 4, higher=faster]: "
+            if LANG == "en"
+            else "Peticiones VT por minuto (VT) [por defecto 4, más alto=más rápido]: "
+        ),
         default="4",
         on_interrupt="back",
     )
@@ -3097,6 +3387,9 @@ def run_ip_analysis_normal(selected_fields, api_keys, resume=None):
                 f"[CKPT] Reanudando análisis de IPs desde índice {start_idx} de {len(ip_list)}"
             )
     idx_global = 0
+    vt_pool_exhausted = False
+    vt_retry_at = 0.0
+    api_cooldown_s = _get_int_env("API_COOLDOWN_S", 3600)
     with open(
         OUTPUT_IPS_CSV, "a" if start_idx > 0 else "w", newline="", encoding="utf-8"
     ) as fh:
@@ -3112,14 +3405,41 @@ def run_ip_analysis_normal(selected_fields, api_keys, resume=None):
             ):
                 if i < start_idx:
                     continue
-                key = api_keys[idx_global % len(api_keys)] if api_keys else None
-                idx_global += 1
                 row = {f: "" for f in fields}
                 row["ip"] = ip
-                if key:
+                if vt_pool_exhausted:
+                    now = time.time()
+                    if now < vt_retry_at:
+                        wait_s = int(vt_retry_at - now)
+                        if wait_s > 0:
+                            print(
+                                f"\n[VT] All VT keys exhausted. Sleeping {wait_s}s before retrying..."
+                                if LANG == "en"
+                                else f"\n[VT] Todas las claves VT agotadas. Durmiendo {wait_s}s antes de reintentar..."
+                            )
+                            time.sleep(wait_s)
+                    vt_pool_exhausted = False
+                    print(
+                        "[VT] Retrying VirusTotal after cooldown."
+                        if LANG == "en"
+                        else "[VT] Reintentando VirusTotal tras cooldown."
+                    )
+                if api_keys:
                     _sleep_rate(rate, rpm=_user_rpm)
-                    r = vt_get_ip(ip, key)
-                    if r.status_code == 200:
+                    r, idx_global, vt_pool_exhausted = vt_get_ip_rotating_keys(
+                        ip,
+                        api_keys,
+                        idx_global,
+                        rotate_statuses={401, 403, 429, 503, 504},
+                    )
+                    if vt_pool_exhausted:
+                        vt_retry_at = time.time() + api_cooldown_s
+                        print(
+                            f"[VT] VirusTotal key pool exhausted (401/403/429/503/504). Cooling down for {api_cooldown_s}s."
+                            if LANG == "en"
+                            else f"[VT] Pool de claves VirusTotal agotado (401/403/429/503/504). Cooldown {api_cooldown_s}s."
+                        )
+                    if r is not None and r.status_code == 200:
                         vt_row = extract_fields_ip(r.json())
                         c_flag, c_reason, c2_flag, c2_reason, score = (
                             analyze_cluster_and_c2(vt_row)
@@ -3129,7 +3449,7 @@ def run_ip_analysis_normal(selected_fields, api_keys, resume=None):
                                 "cluster_flag": c_flag,
                                 "cluster_reason": c_reason,
                                 "c2_suspect": c2_flag,
-                                "c2_reason": c2_reason,
+                                "c2_reason": c_reason,
                                 "risk_score": score,
                             }
                         )
@@ -3137,8 +3457,13 @@ def run_ip_analysis_normal(selected_fields, api_keys, resume=None):
                         for k in vt_row:
                             if k in row:
                                 row[k] = vt_row[k]
+                    elif r is not None:
+                        if vt_pool_exhausted and r.status_code in {429, 403}:
+                            row["owner"] = "VT_POOL_EXHAUSTED"
+                        else:
+                            row["owner"] = f"HTTP{r.status_code}"
                     else:
-                        row["owner"] = f"HTTP{r.status_code}"
+                        row["owner"] = "VT_NO_RESPONSE"
                 else:
                     row["owner"] = "NO_API_KEY"
                 w.writerow({k: row.get(k, "") for k in fields})
@@ -3182,9 +3507,11 @@ def run_ip_analysis_tor(selected_fields, api_keys, resume=None):
         )
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
     _rpm_str = safe_input(
-        "VT requests per minute [default 4, higher=faster]: "
-        if LANG == "en"
-        else "Peticiones VT por minuto (VT+Tor) [por defecto 4, más alto=más rápido]: ",
+        (
+            "VT requests per minute [default 4, higher=faster]: "
+            if LANG == "en"
+            else "Peticiones VT por minuto (VT+Tor) [por defecto 4, más alto=más rápido]: "
+        ),
         default="4",
         on_interrupt="back",
     )
@@ -3228,6 +3555,9 @@ def run_ip_analysis_tor(selected_fields, api_keys, resume=None):
                 f"[CKPT] Reanudando análisis de IPs (+Tor) desde índice {start_idx} de {len(ip_list)}"
             )
     idx_global = 0
+    vt_pool_exhausted = False
+    vt_retry_at = 0.0
+    api_cooldown_s = _get_int_env("API_COOLDOWN_S", 3600)
     with open(
         OUTPUT_IPS_CSV, "a" if start_idx > 0 else "w", newline="", encoding="utf-8"
     ) as fh:
@@ -3247,14 +3577,41 @@ def run_ip_analysis_tor(selected_fields, api_keys, resume=None):
             ):
                 if i < start_idx:
                     continue
-                key = api_keys[idx_global % len(api_keys)] if api_keys else None
-                idx_global += 1
                 row = {f: "" for f in fields}
                 row["ip"] = ip
-                if key:
+                if vt_pool_exhausted:
+                    now = time.time()
+                    if now < vt_retry_at:
+                        wait_s = int(vt_retry_at - now)
+                        if wait_s > 0:
+                            print(
+                                f"\n[VT] All VT keys exhausted. Sleeping {wait_s}s before retrying..."
+                                if LANG == "en"
+                                else f"\n[VT] Todas las claves VT agotadas. Durmiendo {wait_s}s antes de reintentar..."
+                            )
+                            time.sleep(wait_s)
+                    vt_pool_exhausted = False
+                    print(
+                        "[VT] Retrying VirusTotal after cooldown."
+                        if LANG == "en"
+                        else "[VT] Reintentando VirusTotal tras cooldown."
+                    )
+                if api_keys:
                     _sleep_rate(rate, rpm=_user_rpm)
-                    r = vt_get_ip(ip, key)
-                    if r.status_code == 200:
+                    r, idx_global, vt_pool_exhausted = vt_get_ip_rotating_keys(
+                        ip,
+                        api_keys,
+                        idx_global,
+                        rotate_statuses={401, 403, 429, 503, 504},
+                    )
+                    if vt_pool_exhausted:
+                        vt_retry_at = time.time() + api_cooldown_s
+                        print(
+                            f"[VT] VirusTotal key pool exhausted (401/403/429/503/504). Cooling down for {api_cooldown_s}s."
+                            if LANG == "en"
+                            else f"[VT] Pool de claves VirusTotal agotado (401/403/429/503/504). Cooldown {api_cooldown_s}s."
+                        )
+                    if r is not None and r.status_code == 200:
                         vt_row = extract_fields_ip(r.json())
                         c_flag, c_reason, c2_flag, c2_reason, score = (
                             analyze_cluster_and_c2(vt_row)
@@ -3264,7 +3621,7 @@ def run_ip_analysis_tor(selected_fields, api_keys, resume=None):
                                 "cluster_flag": c_flag,
                                 "cluster_reason": c_reason,
                                 "c2_suspect": c2_flag,
-                                "c2_reason": c2_reason,
+                                "c2_reason": c_reason,
                                 "risk_score": score,
                             }
                         )
@@ -3272,8 +3629,13 @@ def run_ip_analysis_tor(selected_fields, api_keys, resume=None):
                         for k in vt_row:
                             if k in row:
                                 row[k] = vt_row[k]
+                    elif r is not None:
+                        if vt_pool_exhausted and r.status_code in {429, 403}:
+                            row["owner"] = "VT_POOL_EXHAUSTED"
+                        else:
+                            row["owner"] = f"HTTP{r.status_code}"
                     else:
-                        row["owner"] = f"HTTP{r.status_code}"
+                        row["owner"] = "VT_NO_RESPONSE"
                 else:
                     row["owner"] = "NO_API_KEY"
                 tor_exit, tor_src, tor_nick, tor_fpr = tor_check_onionoo(ip)
@@ -3336,6 +3698,52 @@ def run_ipapi_script_standalone():
         )
 
 
+def run_p2p_script_standalone():
+    script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "p2p_enrichment.py"
+    )
+    if not os.path.exists(script):
+        if LANG == "en":
+            print(f"[P2P] Script not found: {script}")
+        else:
+            print(f"[P2P] Script no encontrado: {script}")
+        return
+    import subprocess, sys
+
+    try:
+        subprocess.run(
+            [sys.executable, script],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+    except KeyboardInterrupt:
+        if LANG == "en":
+            print("\n[P2P] Interrupted.")
+        else:
+            print("\n[P2P] Interrumpido.")
+
+
+def run_vpn_script_standalone():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    script_path = os.path.join(base_dir, "vpn_enrichment.py")
+
+    if not os.path.exists(script_path):
+        print(
+            f"[!] Script not found: {script_path}"
+            if LANG == "en"
+            else f"[!] Script no encontrado: {script_path}"
+        )
+        return
+
+    try:
+        subprocess.run([sys.executable, script_path], cwd=base_dir, check=False)
+    except Exception as exc:
+        print(
+            f"[!] Error running vpn_enrichment.py: {exc}"
+            if LANG == "en"
+            else f"[!] Error ejecutando vpn_enrichment.py: {exc}"
+        )
+
+
 # === Fechas
 FILL_LAST_RESOLVED_WITH_FIRST = True
 
@@ -3373,9 +3781,11 @@ def run_domains_export(api_keys, resume=None):
     # 0b) Parámetros interactivos (omitir si se reanuda un checkpoint)
     if not resume:
         _max_str = safe_input(
-            "Max domains per IP [default 200, 0=unlimited]: "
-            if LANG == "en"
-            else "Máximo dominios por IP [por defecto 200, 0=sin límite]: ",
+            (
+                "Max domains per IP [default 200, 0=unlimited]: "
+                if LANG == "en"
+                else "Máximo dominios por IP [por defecto 200, 0=sin límite]: "
+            ),
             default="200",
             on_interrupt="back",
         )
@@ -3383,9 +3793,11 @@ def run_domains_export(api_keys, resume=None):
             return
         _max_domains = int(_max_str) if str(_max_str).strip().isdigit() else 200
         _rpm_str = safe_input(
-            "VT requests per minute (DOMAINS) [default 4, higher=faster]: "
-            if LANG == "en"
-            else "Peticiones VT por minuto (DOMAINS) [por defecto 4, más alto=más rápido]: ",
+            (
+                "VT requests per minute (DOMAINS) [default 4, higher=faster]: "
+                if LANG == "en"
+                else "Peticiones VT por minuto (DOMAINS) [por defecto 4, más alto=más rápido]: "
+            ),
             default="4",
             on_interrupt="back",
         )
@@ -3461,7 +3873,9 @@ def run_domains_export(api_keys, resume=None):
         dynamic_ncols=True,
     )
     rate = [None]  # estado para _sleep_rate
-    _dom_creation_cache: dict = {}  # cache domain → creation_date para no repetir llamadas
+    _dom_creation_cache: dict = (
+        {}
+    )  # cache domain → creation_date para no repetir llamadas
 
     written = 0
     try:
@@ -3514,7 +3928,9 @@ def run_domains_export(api_keys, resume=None):
                                 try:
                                     dr = vt_fetch_domain_report(domain, key)
                                     if dr.status_code == 200:
-                                        da = (dr.json().get("data") or {}).get("attributes") or {}
+                                        da = (dr.json().get("data") or {}).get(
+                                            "attributes"
+                                        ) or {}
                                         cd_raw = da.get("creation_date") or ""
                                         _dom_creation_cache[domain] = (
                                             _to_iso_utc(cd_raw) if cd_raw else ""
@@ -3624,9 +4040,11 @@ def run_files_export(api_keys, resume=None):
     # 0b) Parámetros interactivos (omitir si se reanuda)
     if not resume:
         _rpm_str = safe_input(
-            "VT requests per minute (FILES) [default 4, higher=faster]: "
-            if LANG == "en"
-            else "Peticiones VT por minuto (FILES) [por defecto 4, más alto=más rápido]: ",
+            (
+                "VT requests per minute (FILES) [default 4, higher=faster]: "
+                if LANG == "en"
+                else "Peticiones VT por minuto (FILES) [por defecto 4, más alto=más rápido]: "
+            ),
             default="4",
             on_interrupt="back",
         )
@@ -3736,10 +4154,17 @@ def run_files_export(api_keys, resume=None):
 
                 # === VT relations (domain → files) — tres relaciones ===
                 base = "https://www.virustotal.com/api/v3"
-                req_headers = {"x-apikey": key, "User-Agent": "iocsofspades/files-export"}
+                req_headers = {
+                    "x-apikey": key,
+                    "User-Agent": "iocsofspades/files-export",
+                }
                 dom_total = 0
 
-                for rel in ("communicating_files", "referrer_files", "downloaded_files"):
+                for rel in (
+                    "communicating_files",
+                    "referrer_files",
+                    "downloaded_files",
+                ):
                     first_page_url = f"{base}/domains/{domain}/relationships/{rel}"
                     next_url: str | None = first_page_url
                     pages = 0
@@ -3749,7 +4174,9 @@ def run_files_export(api_keys, resume=None):
                         _sleep_rate(rate, rpm=_user_rpm)
                         # Solo en la primera página pasamos params; páginas siguientes
                         # tienen cursor embebido en la URL devuelta por VT.
-                        req_params = {"limit": 40} if next_url == first_page_url else None
+                        req_params = (
+                            {"limit": 40} if next_url == first_page_url else None
+                        )
                         try:
                             resp = requests.get(
                                 next_url,
@@ -3832,7 +4259,9 @@ def run_files_export(api_keys, resume=None):
 
                 pbar.set_postfix_str(f"domain={domain} total_files={dom_total}")
                 if dom_total == 0:
-                    print(f"  [{domain}] → 0 files in all 3 relationships (normal for clean domains)")
+                    print(
+                        f"  [{domain}] → 0 files in all 3 relationships (normal for clean domains)"
+                    )
 
                 save_ckpt(
                     {
@@ -4298,8 +4727,10 @@ def ip_menu(fast_flag: bool, ssl_status: str):
         print("8) Export EVERYTHING (domains by IP + files)")
         print("9) Resume (IPs / DOMAINS / FILES)")
         print("10) IP-API enrichment")
-        print("11) Back")
-        return safe_input("\nChoose an option: ", default="11", on_interrupt="default")
+        print("11) VPN enrichment (ipapi.is)")
+        print("12) P2P tracker enrichment")
+        print("13) Back")
+        return safe_input("\nChoose an option: ", default="13", on_interrupt="default")
     else:
         print(f"\n=== MENÚ IPs  [SSL: {ssl_status.upper()}] ===")
         print("1) Analizar IPs en VirusTotal (VT)")
@@ -4312,9 +4743,11 @@ def ip_menu(fast_flag: bool, ssl_status: str):
         print("8) Exportar TODO (dominios por IP + ficheros)")
         print("9) Reanudar (IPs / DOMAINS / FILES)")
         print("10) IP-API enrichment")
-        print("11) Volver")
+        print("11) VPN enrichment (ipapi.is)")
+        print("12) P2P tracker enrichment")
+        print("13) Volver")
         return safe_input(
-            "\nSelecciona una opción: ", default="11", on_interrupt="default"
+            "\nSelecciona una opción: ", default="13", on_interrupt="default"
         )
 
 
@@ -4616,7 +5049,37 @@ def main():
     select_language()
 
     ssl_status = auto_check_ssl()
-    api_keys = read_lines(API_KEYS_FILE) if os.path.exists(API_KEYS_FILE) else []
+    all_keys = load_api_keys()
+    api_keys = all_keys["VT"]
+
+    if all_keys["ABUSEIPDB"]:
+        os.environ.setdefault("ABUSEIPDB_API_KEY", ",".join(all_keys["ABUSEIPDB"]))
+    if all_keys["ABUSECH"]:
+        os.environ.setdefault("ABUSECH_AUTH_KEY", ",".join(all_keys["ABUSECH"]))
+        os.environ.setdefault("MBZ_AUTH_KEY", all_keys["ABUSECH"][0])
+    if all_keys["OTX"]:
+        os.environ.setdefault("OTX_API_KEY", ",".join(all_keys["OTX"]))
+
+    loaded = ["VT"] if api_keys else []
+    if all_keys["ABUSEIPDB"]:
+        loaded.append("AbuseIPDB")
+    if all_keys["ABUSECH"]:
+        loaded.append("abuse.ch (ThreatFox/URLhaus/MBZ)")
+    if all_keys["OTX"]:
+        loaded.append("OTX")
+    if loaded:
+        print(
+            f"[API] Loaded keys: {', '.join(loaded)}"
+            if LANG == "en"
+            else f"[API] Claves cargadas: {', '.join(loaded)}"
+        )
+    else:
+        print(
+            "[API] No API keys loaded from IOCS-apikeys.txt."
+            if LANG == "en"
+            else "[API] No se han cargado API keys desde IOCS-apikeys.txt."
+        )
+
     selected_fields_ips = ["ip"] + ALL_FIELDS
 
     while True:
@@ -4658,8 +5121,9 @@ def main():
                     run_files_export(api_keys)
                 elif sub == "9":
                     import datetime as _dt_ckpt
+
                     _ckpts = _list_available_ckpts(
-                        modes=["ips", "ips_tor", "domains", "files"]
+                        modes=["ips", "ips_tor", "ip_osint", "domains", "files"]
                     )
                     if not _ckpts:
                         print(
@@ -4678,6 +5142,8 @@ def main():
                             run_ip_analysis_tor(
                                 selected_fields_ips, api_keys, resume=ck
                             )
+                        elif _mode == "ip_osint":
+                            run_ip_osint_scan(resume=ck)
                         elif _mode == "domains":
                             run_domains_export(api_keys, resume=ck)
                         elif _mode == "files":
@@ -4699,9 +5165,11 @@ def main():
                                 else f"  {_n}) [{_c.get('mode','?')}]  idx={_c.get('idx','?')}  guardado: {_ts}"
                             )
                         _pick = safe_input(
-                            "\nChoose number (enter=cancel): "
-                            if LANG == "en"
-                            else "\nElige número (enter=cancelar): ",
+                            (
+                                "\nChoose number (enter=cancel): "
+                                if LANG == "en"
+                                else "\nElige número (enter=cancelar): "
+                            ),
                             default="",
                             on_interrupt="back",
                         )
@@ -4718,6 +5186,8 @@ def main():
                                     run_ip_analysis_tor(
                                         selected_fields_ips, api_keys, resume=ck
                                     )
+                                elif _mode == "ip_osint":
+                                    run_ip_osint_scan(resume=ck)
                                 elif _mode == "domains":
                                     run_domains_export(api_keys, resume=ck)
                                 elif _mode == "files":
@@ -4732,7 +5202,11 @@ def main():
                             print("Cancelado.\n")
                 elif sub == "10":
                     run_ipapi_script_standalone()
-                elif sub == "11" or sub.lower() in ("b", "q", "x"):
+                elif sub == "11":
+                    run_vpn_script_standalone()
+                elif sub == "12":
+                    run_p2p_script_standalone()
+                elif sub == "13" or sub.lower() in ("b", "q"):
                     print()
                     break
                 else:
@@ -4854,7 +5328,7 @@ def main():
                             run_domain_osint_lookup(list_file=path, resume=ck)
 
                 # ⭐⭐⭐ ESTE ES EL ARREGLO REAL
-                elif sub == "4" or sub.lower() in ("b", "q", "x"):
+                elif sub == "4":
                     break
 
                 else:
@@ -4966,7 +5440,7 @@ def main():
                         else:
                             run_hash_osint_lookup(list_file=path, resume=ck)
 
-                elif sub == "5" or sub.lower() in ("b", "q", "x"):
+                elif sub == "5":
                     print(
                         "\nReturning to main menu…\n"
                         if LANG == "en"
