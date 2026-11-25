@@ -94,6 +94,7 @@ IP MODE:
 - VirusTotal
 - Passive DNS
 - OSINT
+- ASN-DROP: IP-API is primary; local IPtoASN is the fallback (IPs are sent to IP-API).
 - Tor mode
 - Exportación a CSV
 - Reanudar desde checkpoint

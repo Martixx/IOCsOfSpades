@@ -886,6 +886,40 @@ def parse_key_pool(raw_value: str) -> list:
     return out
 
 
+def parse_api_key_file(lines: list[str]) -> dict[str, list[str]]:
+    aliases = {
+        "ABUSEIPDB": "abuseipdb",
+        "ABUSEIPDB_API_KEY": "abuseipdb",
+        "ABUSECH": "abusech",
+        "ABUSECH_AUTH_KEY": "abusech",
+        "MBZ_AUTH_KEY": "abusech",
+        "OTX": "otx",
+        "OTX_API_KEY": "otx",
+    }
+    pools = {"abuseipdb": [], "abusech": [], "otx": []}
+
+    for line in lines:
+        name, separator, value = line.partition("=")
+        if not separator:
+            continue
+        pool_name = aliases.get(name.strip().upper())
+        if pool_name is None:
+            continue
+        for key in parse_key_pool(value):
+            if key not in pools[pool_name]:
+                pools[pool_name].append(key)
+
+    return pools
+
+
+def resolve_api_key_pool(env_names: tuple[str, ...], file_keys: list[str]) -> list[str]:
+    for env_name in env_names:
+        keys = parse_key_pool(os.getenv(env_name) or "")
+        if keys:
+            return keys
+    return file_keys
+
+
 def rotating_lookup(key_pool, idx_ptr, fn_lookup, status_field, rotate_statuses):
     if not key_pool:
         return {}, idx_ptr, True
@@ -1434,7 +1468,12 @@ def load_ip_asn_from_last_ultra_csv():
         return {}
 
 
-def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
+def parse_ipapi_asn(value: str) -> int | None:
+    match = re.search(r"\bAS\s*(\d+)\b", str(value or ""), re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None, api_keys=None):
     print(
         "\n=== ANALYZE IPs IN OTHER SOURCES (OSINT) ==="
         if LANG == "en"
@@ -1473,12 +1512,17 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
     # 2) Toggles por fuente
     osint_toggles = globals().get("OSINT_IP_SOURCES", OSINT_IP_SOURCES)
 
-    # 2.5) API keys para fuentes nuevas
-    abuseipdb_keys = parse_key_pool(os.getenv("ABUSEIPDB_API_KEY") or "")
-    abusech_keys = parse_key_pool(
-        os.getenv("ABUSECH_AUTH_KEY") or os.getenv("MBZ_AUTH_KEY") or ""
+    # 2.5) API keys from the file, with environment variables taking precedence.
+    if api_keys is None:
+        api_keys = read_lines(API_KEYS_FILE) if os.path.exists(API_KEYS_FILE) else []
+    file_key_pools = parse_api_key_file(api_keys)
+    abuseipdb_keys = resolve_api_key_pool(
+        ("ABUSEIPDB_API_KEY",), file_key_pools["abuseipdb"]
     )
-    otx_keys = parse_key_pool(os.getenv("OTX_API_KEY") or "")
+    abusech_keys = resolve_api_key_pool(
+        ("ABUSECH_AUTH_KEY", "MBZ_AUTH_KEY"), file_key_pools["abusech"]
+    )
+    otx_keys = resolve_api_key_pool(("OTX_API_KEY",), file_key_pools["otx"])
 
     abuseipdb_key = abuseipdb_keys[0] if abuseipdb_keys else ""
     abusech_key = abusech_keys[0] if abusech_keys else ""
@@ -1491,21 +1535,21 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
 
     if osint_toggles.get("abuseipdb", True) and not abuseipdb_key:
         print(
-            "[OSINT] AbuseIPDB: skipped (set ABUSEIPDB_API_KEY env var to enable)"
+            "[OSINT] AbuseIPDB: skipped (set ABUSEIPDB_API_KEY or add ABUSEIPDB= to IOCS-apikeys.txt)"
             if LANG == "en"
-            else "[OSINT] AbuseIPDB: omitido (configura ABUSEIPDB_API_KEY para activar)"
+            else "[OSINT] AbuseIPDB: omitido (configura ABUSEIPDB_API_KEY o añade ABUSEIPDB= a IOCS-apikeys.txt)"
         )
     if osint_toggles.get("threatfox", True) and not abusech_key:
         print(
-            "[OSINT] ThreatFox: skipped (set ABUSECH_AUTH_KEY env var to enable)"
+            "[OSINT] ThreatFox: skipped (set ABUSECH_AUTH_KEY or add ABUSECH= to IOCS-apikeys.txt)"
             if LANG == "en"
-            else "[OSINT] ThreatFox: omitido (configura ABUSECH_AUTH_KEY para activar)"
+            else "[OSINT] ThreatFox: omitido (configura ABUSECH_AUTH_KEY o añade ABUSECH= a IOCS-apikeys.txt)"
         )
     if osint_toggles.get("otx", True) and not otx_key:
         print(
-            "[OSINT] OTX: skipped (set OTX_API_KEY env var or OTX= in apikeys file)"
+            "[OSINT] OTX: skipped (set OTX_API_KEY or add OTX= to IOCS-apikeys.txt)"
             if LANG == "en"
-            else "[OSINT] OTX: omitido (configura OTX= en el fichero de apikeys)"
+            else "[OSINT] OTX: omitido (configura OTX_API_KEY o añade OTX= a IOCS-apikeys.txt)"
         )
 
     # 3) Carga de feeds (respetando toggles)
@@ -1545,43 +1589,18 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
     ip2asn_ready = load_ip2asn_index()
     if ip2asn_ready:
         print(
-            "[IP2ASN] Index available for resolving ASN without VT."
+            "[IP2ASN] Local index available as ASN fallback."
             if LANG == "en"
-            else "[IP2ASN] índice disponible para resolver ASN sin VT."
+            else "[IP2ASN] Índice local disponible como respaldo para resolver ASN."
         )
     else:
         print(
-            "[IP2ASN] Index not available (ASN resolution will fallback to VT only)."
+            "[IP2ASN] Local index unavailable; unresolved IPs will have no ASN."
             if LANG == "en"
-            else "[IP2ASN] índice no disponible (se trabajará sin ASN local)."
+            else "[IP2ASN] Índice local no disponible; las IPs sin resultado de IP-API quedarán sin ASN."
         )
 
-    # 4) Mapa IP → ASN (desde el último *_ULTRA.csv) si procede (VT)
-    ip2asn_map = {}
-    if osint_toggles.get("asn_drop", True) and asn_drop:
-        try:
-            ip2asn_map = load_ip_asn_from_last_ultra_csv()
-            if ip2asn_map:
-                print(
-                    f"[OSINT] IP→ASN map from *_ULTRA.csv: {len(ip2asn_map)} IPs with ASN"
-                    if LANG == "en"
-                    else f"[OSINT] Mapa IP→ASN desde *_ULTRA.csv: {len(ip2asn_map)} IPs con ASN"
-                )
-            else:
-                print(
-                    "[OSINT] Empty IP→ASN map (have you run IP > 1) VT to generate *_ULTRA.csv?)."
-                    if LANG == "en"
-                    else "[OSINT] Mapa IP→ASN vacío (¿has corrido IP > 1) VT para generar *_ULTRA.csv?)."
-                )
-        except Exception as e:
-            print(
-                f"[OSINT] Error building IP→ASN map: {e}"
-                if LANG == "en"
-                else f"[OSINT] Error construyendo mapa IP→ASN: {e}"
-            )
-            ip2asn_map = {}
-
-    # 5) Configuración de salida
+    # 4) Configuración de salida
     out_csv = f"{formatted_time}_ULTRA_OSINT.csv"
     fields = [
         "ip",
@@ -1636,6 +1655,34 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
         if (resume and resume.get("mode") == "ip_osint")
         else 0
     )
+    ipapi_asn_map = {}
+    scan_ips = ip_list[start_i:]
+    if osint_toggles.get("asn_drop", True) and asn_drop and scan_ips:
+        import ipapi_enrichment
+
+        batches = list(ipapi_enrichment.chunks(scan_ips, ipapi_enrichment.BATCH_SIZE))
+        print(
+            f"[IP-API] Resolving ASN for {len(scan_ips)} IPs in {len(batches)} batch(es)."
+            if LANG == "en"
+            else f"[IP-API] Resolviendo ASN para {len(scan_ips)} IPs en {len(batches)} lote(s)."
+        )
+        for batch_number, batch in enumerate(batches, start=1):
+            results = ipapi_enrichment.query_ipapi(batch)
+            for result in results:
+                if not isinstance(result, dict) or result.get("status") != "success":
+                    continue
+                ip = str(result.get("query") or "").strip()
+                asn = parse_ipapi_asn(result.get("as"))
+                if ip and asn is not None:
+                    ipapi_asn_map[ip] = asn
+            if batch_number < len(batches):
+                time.sleep(ipapi_enrichment.SLEEP_TIME)
+        print(
+            f"[IP-API] ASN resolved for {len(ipapi_asn_map)}/{len(scan_ips)} IPs."
+            if LANG == "en"
+            else f"[IP-API] ASN resuelto para {len(ipapi_asn_map)}/{len(scan_ips)} IPs."
+        )
+
     mode = "a" if start_i > 0 else "w"
 
     # Contadores de resumen
@@ -1766,14 +1813,10 @@ def run_ip_osint_scan(list_path=IP_LIST_FILE, resume=None):
                     row["bl_et_compromised"] = "yes"
                     hits_et += 1
 
-                # ASN-DROP (orden de resolución: VT → IPtoASN)
+                # ASN-DROP (IP-API primero; IPtoASN local como respaldo)
                 asn_num = None
                 if asn_drop:
-                    # 1) VT (si existe *_ULTRA.csv con mapa ip→asn)
-                    if ip2asn_map:
-                        asn_num = ip2asn_map.get(ip)
-
-                    # 2) IPtoASN (índice local, sin VT)
+                    asn_num = ipapi_asn_map.get(ip)
                     if asn_num is None and ip2asn_ready:
                         asn_num = ip2asn_lookup(ip)
 
@@ -4641,7 +4684,7 @@ def main():
                 if sub == "1":
                     run_ip_analysis_normal(selected_fields_ips, api_keys)
                 elif sub == "2":
-                    run_ip_osint_scan()
+                    run_ip_osint_scan(api_keys=api_keys)
                 elif sub == "3":
                     run_ip_analysis_tor(selected_fields_ips, api_keys)
                 elif sub == "4":
