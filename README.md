@@ -1,178 +1,139 @@
-# IOCs of Spades — 2.2 "Lemmy"
+# ♠️ IOCs of Spades — 2.2 "Lemmy"
+
 **BORN TO SCAN // LIVE TO WIN**  
 **🤘 Everything louder than everything else 🤘**
 
-IOCs of Spades es una macarrada para automatizar:
-- Búsqueda y análisis de IOCs  
-- Consultas OSINT  
-- VirusTotal API  
-- Passive DNS  
-- Exportación masiva de indicadores  
-- Checks anti‑MITM (detector de proxies tipo Zscaler, ForwardTrust, VPN intercept…)  
-- Modos de pausa/reanudar para análisis largos  
+Forged with Lemmy Kilmister blasting in the background. Not the fastest beast on the road, but loud enough to wake the SOC.
 
-Forjada escuchando a Lemmy Kilmister, no muy rápida, pero siempre ruidosa. (Ojo con algunas opciones que te petan la API)
+**IOCs of Spades** is a no-nonsense Python CLI for investigating and enriching indicators of compromise: **IPs, domains, and file hashes**. It brings OSINT lookups, threat-intelligence APIs, Passive DNS, bulk exports, and resumable jobs into one gloriously noisy toolbox.
 
-------------------------------------------------------------
-FEATURES
-------------------------------------------------------------
+Built for SOC analysts, threat hunters, and incident responders who would rather investigate than copy-paste IOCs all day.
 
-- Automatización OSINT (IPs, dominios, hashes)
-- Detección automática de interceptación SSL/mitm
-- Passive DNS + VirusTotal
-- Modo Tor / Onionoo
-- Caché OSINT local
-- Pausar y reanudar análisis
-- Exportación de análisis a CSV
-- Compatible con Linux y Windows
+## ⚡ What’s under the hood?
 
-------------------------------------------------------------
-REQUISITOS
-------------------------------------------------------------
+- **IP mode:** VirusTotal, Passive DNS, OSINT, ASN information, ASN-DROP, Tor/Onionoo, CSV exports, and checkpoints.
+- **Domain mode:** VirusTotal list lookups, OSINT, and resume support.
+- **Hash mode:** VirusTotal (single or bulk), MalwareBazaar, and resume support.
+- **Threat intel sources:** VirusTotal, AbuseIPDB, abuse.ch, and AlienVault OTX integrations.
+- **TLS interception checks:** Warnings for possible corporate proxies, SSL inspection, and VPN-related connection issues. A warning does **not** automatically mean an attack.
+- **Local OSINT cache:** Reuse stored results instead of hammering APIs unnecessarily.
+- **Pause and resume:** Checkpoints for long-running supported workflows.
+- **Extras:** Debug menu, recent IP suggestions, and timestamped CSV output.
 
-Python:
-Se requiere Python 3.10 o superior.
+Works on **Windows and Linux**. No database, no daemon, no fancy infrastructure. Just Python and a healthy disregard for repetitive work.
 
-En Linux (Debian/Ubuntu):
-    sudo apt install python3 python3-pip
+## 🔥 Quick setup for the terminally impatient
 
-En Windows:
-    Descargar desde https://www.python.org/downloads/
+**Requirements:** Python **3.10+** and two packages:
 
-Dependencias:
-    pip install requests tqdm
+```bash
+python -m pip install requests tqdm
+```
 
-------------------------------------------------------------
-SETUP RÁPIDO PARA MANCOS
-------------------------------------------------------------
+On Debian/Ubuntu, install Python and pip first if needed:
 
-1. Crear un archivo llamado IOCS-apikeys.txt en la misma carpeta.
-   Puedes copiar la plantilla incluida en el repo:
-      IOCS-apikeys.example.txt
+```bash
+sudo apt install python3 python3-pip
+```
 
-   Formato recomendado (KEY=valor):
-      VT=tu_vt_key_1
-      VT=tu_vt_key_2
-      ABUSEIPDB=tu_abuseipdb_key_1,tu_abuseipdb_key_2
-      ABUSECH=tu_abusech_key_1,tu_abusech_key_2
-      OTX=tu_otx_key_1,tu_otx_key_2
+On Windows, get Python from [python.org](https://www.python.org/downloads/). Windows Terminal or VS Code's terminal is recommended if the banner looks like it survived a stage dive.
 
-   Notas:
-   - VT también acepta formato legado sin prefijo (una key por línea).
-   - Para ABUSEIPDB/ABUSECH/OTX puedes usar varias claves separadas por coma,
-    punto y coma o espacios.
-   - Nunca subas IOCS-apikeys.txt con claves reales.
+### 1. Get the code
 
-2. (Opcional) Crear archivos de listas:
-       iplist.txt
-       dominios.txt
-       hashes.txt
+Download or clone [IOCs of Spades](https://github.com/Martixx/IOCsOfSpades/tree/main).
 
-   Pueden estar vacíos o contener listas de IOCs.
+### 2. Bring your own API keys
 
-3. Instalar dependencias:
-       pip install requests tqdm
+Copy `IOCS-apikeys.example.txt` to `IOCS-apikeys.txt` in the project directory and add the keys you use:
 
-4. Ejecutar la herramienta:
+```text
+VT=your_vt_key_1
+VT=your_vt_key_2
+ABUSEIPDB=your_abuseipdb_key_1,your_abuseipdb_key_2
+ABUSECH=your_abusech_key_1,your_abusech_key_2
+OTX=your_otx_key_1,your_otx_key_2
+```
 
-   En Linux:
-       python3 IOCsOfSpades.py
+VirusTotal also accepts the legacy format (one unprefixed key per line). For AbuseIPDB, abuse.ch, and OTX, multiple keys can be separated by commas, semicolons, or spaces.
 
-   En Windows:
-       python IOCsOfSpades.py
+**Never commit real keys.** Keep `IOCS-apikeys.txt` out of Git, including its history. Without keys, only supported unauthenticated OSINT features are available; VirusTotal requires a valid key.
 
-5. Notas importantes:
-   - Sin IOCS-apikeys.txt, sólo funcionarán modos OSINT (VT necesitará una key).
-   - La carpeta .osint_cache/ se genera automáticamente.
-   - Si el banner se descuadra en CMD, usar Windows Terminal o terminal de VS Code.
+### 3. Feed the beast
 
-------------------------------------------------------------
-MODOS PRINCIPALES
-------------------------------------------------------------
+Optionally create these IOC lists in the project directory:
 
-IP MODE:
-- VirusTotal
-- Passive DNS
-- OSINT
-- ASN-DROP: IP-API is primary; local IPtoASN is the fallback (IPs are sent to IP-API).
-- Tor mode
-- Exportación a CSV
-- Reanudar desde checkpoint
+- `iplist.txt`
+- `dominios.txt`
+- `hashes.txt`
 
-DOMAIN MODE:
-- VT list
-- OSINT
-- Reanudar
+They may be empty until you're ready to investigate.
 
-HASH MODE:
-- VT (single / list)
-- MalwareBazaar
-- Reanudar
+### 4. Fire it up
 
-EXTRAS:
-- Menú de debug
-- Sugerencias de IP recientes
-- Caché persistente
+Linux:
 
-------------------------------------------------------------
-PREGUNTAS FRECUENTES (FAQ)
-------------------------------------------------------------
+```bash
+python3 IOCsOfSpades.py
+```
 
-1. ¿Qué necesita la herramienta para funcionar?
-   - Python 3.10+
-   - pip install requests tqdm
-   - Archivo IOCS-apikeys.txt con tus claves de VT
+Windows:
 
-2. ¿Dónde pongo las claves de VirusTotal?
-   En IOCS-apikeys.txt.
-   Revisa la plantilla IOCS-apikeys.example.txt para el formato completo.
+```powershell
+python IOCsOfSpades.py
+```
 
-3. ¿Necesito iplist.txt / dominios.txt / hashes.txt?
-   Opcional. Pueden estar vacíos, pero lo suyo es que consultes IOCs y en algún sitio los tendrás que meter. Digo yo.
+Follow the interactive menu. **No guitar lessons required.**
 
-4. ¿Puedo usar la herramienta sin API keys?
-   Sí. Funciona el modo OSINT.  
-   VirusTotal requerirá una API key.
+## 🛡️ Don't blame the API (yet)
 
-5. ¿Funciona en Linux?
-   Sí. Incluso mejor que en Windows.
+**TLS / anti-MITM checks:** The tool can flag possible HTTPS interception by corporate proxies, certificate substitution, or VPN-related connectivity problems. These are diagnostic signals, **not proof of malicious MITM**. Check your network environment before drawing conclusions.
 
-6. ¿Funciona en Windows?
-   Sí.  
-   Se recomienda Windows Terminal o terminal de VS Code.
+**ASN-DROP:** IP-API is the primary source; local IPtoASN data is the fallback. **IP addresses are sent to IP-API** when that lookup is used.
 
-7. ¿Dónde se guarda la caché OSINT?
-   En la carpeta .osint_cache/.
+**Cache:** OSINT results are stored locally in `.osint_cache/`.
 
-8. ¿Se pueden usar varias claves de VT?
-   Sí. Es recomendable para rotar y evitar límites.
+**Checkpoints:** Supported modes can resume interrupted runs. Handy when a huge IOC list meets a flaky connection.
 
-9. ¿Por qué se detiene el análisis?
-   Usa un sistema de pausa/reanudar mediante checkpoints. Si tiras una consulta enorme y por lo que sea tienes que levantar una VPN, lo puedes parar y luego reanudar. 
+**CSV:** Exports include timestamps for later filtering, correlation, and investigation.
 
-10. ¿Por qué sale mensaje de MITM?
-    El script detecta proxies corporativos, SSL intercept, etc. Es la protección anti-mancos por si te has dejado una VPN encendida y no llegas a la API de VT.
+## ⚠️ API limits: don't kill the drummer
 
-11. ¿Qué exporta?
-    Resultados en CSV con timestamp.
+Bulk lookups and Passive DNS can chew through quotas faster than a double-kick pedal.
 
-12. ¿Es portable?
-    Sí. No requiere instalación, bases de datos ni demonios.
+- Check each provider's API terms, quotas, and allowed use cases.
+- Use the local cache and avoid pointless repeat lookups.
+- Expect rate limits, timeouts, and service-specific restrictions.
+- Multiple API keys are supported, **not** a license to bypass provider limits. In particular, do not use multiple VirusTotal accounts to evade public API quotas.
 
-------------------------------------------------------------
-LICENSE
-------------------------------------------------------------
+## 🔒 Privacy, secrets & common sense
 
-Este proyecto está bajo Apache License 2.0.
-Free to use, modify, and share — built for noise, chaos, and overdrive.
-El texto completo de la licencia está en LICENSE.txt.
+This tool sends queried indicators to external services depending on the mode selected. **Do not submit confidential customer IOCs or internal infrastructure details without authorization.** Review provider terms and your organization's data-handling rules first.
 
-------------------------------------------------------------
-AUTORÍA TÉCNICA
-------------------------------------------------------------
+Protect your API-key file, cache, checkpoints, and exported CSVs. A bad reputation score is a lead, **not** a verdict. Humans still have to investigate.
 
-Proyecto creado con fines técnicos, formativos y operativos.  
-Diseñado para analistas, SOCs y equipos de respuesta que necesitan
-automatizar consultas y análisis OSINT cagando melodías.
+## ❓ FAQ for the sleep-deprived
 
-------------------------------------------------------------
+**Can I run it without API keys?** Some OSINT modes, yes. VirusTotal, no.
+
+**Can I stop a long run?** Supported workflows use checkpoints so you can resume.
+
+**Why am I seeing a MITM warning?** A proxy, TLS inspection device, or VPN may be interfering with the connection. Investigate before panicking.
+
+**Does it need a database?** Nope.
+
+**Does it run on Windows?** Yep. Linux too.
+
+**Where's the cache?** `.osint_cache/`.
+
+## 📜 License
+
+Licensed under **Apache License 2.0**. See `LICENSE.txt` for the full terms.
+
+## 🤘 Final words
+
+An independent technical project built for learning, operations, and the occasional very loud incident investigation.
+
+**No bloat. No bullshit. Just IOCs, Python, and rock ’n’ roll.**
+
+**♠️ IOCs OF SPADES ♠️**<br>
+**BORN TO SCAN // LIVE TO WIN**
